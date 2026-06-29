@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using Godot;
 
@@ -95,6 +96,23 @@ public partial class MultiplayerReplicator : Node
 	// EVENTS
 	// -----------------------------------------------------------------------------------------------------------------
 
+	public override void _ValidateProperty(Godot.Collections.Dictionary property)
+	{
+		base._ValidateProperty(property);
+		switch (property["name"].AsString()) {
+			case nameof(ReplicatedFields):
+				string propNames = this.ParentCache.GetPropertyList()
+					.Where(prop => (prop["usage"].AsInt64() & (long) PropertyUsageFlags.Storage) != 0)
+					.Select(prop => prop["name"].AsString())
+					.ToArray()
+					.Join(",");
+				property["type"] = (long) Variant.Type.Array;
+				property["hint"] = (long) PropertyHint.ArrayType;
+				property["hint_string"] = $"{Variant.Type.String:D}/{PropertyHint.EnumSuggestion:D}:{propNames}";
+				break;
+		}
+	}
+
 	public override void _EnterTree()
 	{
 		base._EnterTree();
@@ -154,10 +172,16 @@ public partial class MultiplayerReplicator : Node
 	// METHODS
 	// -----------------------------------------------------------------------------------------------------------------
 
-	public ReplicationData GetReplicationData()
+	public bool TryGetReplicationData([NotNullWhen(true)] out ReplicationData? data)
 	{
-		this.UpdateDirtiness();
-		return new(this.ReplicatorId, this.DirtyFieldsMask, this.GetDirtyFieldValues().ToArray());
+		if (this.IsMultiplayerAuthority())
+		{
+			this.UpdateDirtiness();
+			data = new(this.ReplicatorId, this.DirtyFieldsMask, this.GetDirtyFieldValues().ToArray());
+		}
+		else
+			data = null;
+		return data != null;
 	}
 
 	/// <summary>

@@ -5,6 +5,8 @@ namespace Raele.MultiplayerReplication;
 
 public record ReplicationPacket(ReplicationData[] ReplicationData, AckData[] AckData)
 {
+	public bool Empty => this.ReplicationData.Length == 0 && this.AckData.Length == 0;
+
 	public Variant Serialize()
 		=> new Godot.Collections.Array()
 		{

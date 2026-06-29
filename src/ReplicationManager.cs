@@ -82,7 +82,6 @@ public partial class ReplicationManager : Node
     public override void _EnterTree()
 	{
 		base._EnterTree();
-		this.Multiplayer.MultiplayerPeer ??= new OfflineMultiplayerPeer();
 		this.Multiplayer.PeerConnected += this.OnPeerConnected;
 		this.Multiplayer.PeerDisconnected += this.OnPeerDisconnected;
 		this.Multiplayer.ConnectedToServer += this.OnConnectedToServer;
@@ -121,22 +120,22 @@ public partial class ReplicationManager : Node
 	// CONNECTIVITY METHODS
 	// -----------------------------------------------------------------------------------------------------------------
 
-    public void StartMultiplayerServer(int port = DEFAULT_PORT)
+    public void StartServer(int port = DEFAULT_PORT)
 	{
 		this.Disconnect();
 		ENetMultiplayerPeer peer = new();
 		peer.CreateServer(port);
 		this.Multiplayer.MultiplayerPeer = peer;
-		GD.PrintS(this.Multiplayer.MultiplayerPeer.GetUniqueId(), nameof(ReplicationManager), "🌐 Server started.");
+		GD.PrintS(this.Multiplayer.MultiplayerPeer.GetUniqueId(), nameof(ReplicationManager), "🌐 Server started.", new { port });
 		this.EmitSignal(SignalName.ServerStarted);
 	}
 
-	public async Task ConnectToServer(string connectAddress, int port = DEFAULT_PORT)
+	public async Task ConnectToServer(string address, int port = DEFAULT_PORT)
 	{
 		this.Disconnect();
-		GD.PrintS(this.Multiplayer.MultiplayerPeer.GetUniqueId(), nameof(ReplicationManager), "🌐 Connecting to server...", new { connectAddress });
+		GD.PrintS(this.Multiplayer.MultiplayerPeer.GetUniqueId(), nameof(ReplicationManager), "🌐 Connecting to server...", new { address, port });
 		ENetMultiplayerPeer peer = new();
-		peer.CreateClient(connectAddress, DEFAULT_PORT);
+		peer.CreateClient(address, port);
 		this.Multiplayer.MultiplayerPeer = peer;
 
 		TaskCompletionSource source = new();
@@ -188,7 +187,10 @@ public partial class ReplicationManager : Node
 
 	public void Disconnect()
 	{
-		if (this.ConnectionStatus == MultiplayerPeer.ConnectionStatus.Disconnected)
+		if (
+			this.Multiplayer.MultiplayerPeer is OfflineMultiplayerPeer
+			|| this.ConnectionStatus == MultiplayerPeer.ConnectionStatus.Disconnected
+		)
 			return;
 		else if (this.Multiplayer.IsServer())
 			this.StopMultiplayerServer();
@@ -287,18 +289,17 @@ public partial class ReplicationManager : Node
 
 		// Update replication data for all replicators and enqueue it for all peers.
 		foreach(MultiplayerReplicator replicator in this.Replicators.Values)
-		{
-			ReplicationData data = replicator.GetReplicationData();
-			foreach (PeerController peer in this.PeerControllers.Values)
-				peer.PutReplicationData(data);
-		}
+			if (replicator.TryGetReplicationData(out ReplicationData? data))
+				foreach (PeerController peer in this.PeerControllers.Values)
+					peer.PutReplicationData(data);
 
 		// Send replication packets to all peers. The replication packet contains both replication data and
 		// acknowledgment data enqueued to be sent to that peer.
 		foreach (PeerController peer in this.PeerControllers.Values)
 		{
 			ReplicationPacket packet = peer.CreateReplicationPacket(clearAckQueue: true);
-			this.RpcId(peer.PeerId, MethodName.RpcAcceptReplicationData, packet.Serialize());
+			if (!packet.Empty)
+				this.RpcId(peer.PeerId, MethodName.RpcAcceptReplicationData, packet.Serialize());
 		}
 	}
 
