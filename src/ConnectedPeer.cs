@@ -7,9 +7,9 @@ namespace Raele.MultiplayerReplication;
 /// <summary>
 /// Holds replication information related to a single peer, including its interests and replication queue.
 /// </summary>
-public class PeerController
+public class ConnectedPeer
 {
-	public PeerController(long peerId) => this.PeerId = peerId;
+	public ConnectedPeer(long peerId) => this.PeerId = peerId;
 
 	/// <summary>
 	/// The unique identifier for the peer.
@@ -35,7 +35,7 @@ public class PeerController
 	/// Adds replication data to the queue to be sent to the peer in the next replication packet. If there is already
 	/// replication data for the same replicator ID, the new replication data is merged with the existing one.
 	/// </summary>
-	public void PutReplicationData(ReplicationData newData)
+	public void EnqueueReplicationData(ReplicationData newData)
 	{
 		if (this.ReplicationQueue.TryGetValue(newData.ReplicatorId, out ReplicationData? currentData))
 			currentData.MergeInplace(newData.FieldMask, newData.Values);
@@ -51,7 +51,7 @@ public class PeerController
 	/// we enqueue acknowledgement data to send back to in the next replication packet.
 	/// </summary>
 	/// <param name="ackData"></param>
-	public void PutAck(AckData ackData)
+	public void EnqueueAck(AckData ackData)
 	{
 		this.AckQueue[ackData.ReplicatorId] = this.AckQueue.GetValueOrDefault(ackData.ReplicatorId)?.Union(ackData)
 			?? ackData;
@@ -62,13 +62,13 @@ public class PeerController
 	/// called by the ReplicationManager when it receives acknowledgment data from the peer, so that we stop sending
 	/// replication data for the specified replicator fields.
 	/// </summary>
-	public void ClearReplicationData(Guid replicatorId, uint fieldMask)
+	public void AcceptAck(AckData ack)
 	{
 		if (
-			this.ReplicationQueue.TryGetValue(replicatorId, out ReplicationData? data)
-			&& data.AckInplace(fieldMask)
+			this.ReplicationQueue.TryGetValue(ack.ReplicatorId, out ReplicationData? data)
+			&& data.AckInplace(ack.FieldMask)
 		)
-			this.ReplicationQueue.Remove(replicatorId);
+			this.ReplicationQueue.Remove(ack.ReplicatorId);
 	}
 
 	// /// <summary>

@@ -1,5 +1,6 @@
 using System;
 using System.Linq;
+using System.Numerics;
 using Godot;
 
 namespace Raele.MultiplayerReplication;
@@ -9,6 +10,31 @@ namespace Raele.MultiplayerReplication;
 /// </summary>
 public class ReplicationData
 {
+	// -----------------------------------------------------------------------------------------------------------------
+	// STATICS AND CONSTRUCTORS
+	// -----------------------------------------------------------------------------------------------------------------
+
+	public static ReplicationData Deserialize(Variant data)
+	{
+		Guid replicatorId = new(data.AsGodotArray()[0].AsByteArray());
+		uint fieldMask = data.AsGodotArray()[1].AsUInt32();
+		Variant[] values = data.AsGodotArray()[2].AsGodotArray().ToArray();
+		return new(replicatorId, fieldMask, values);
+	}
+
+	public static Variant Serialize(ReplicationData data)
+		=> new Godot.Collections.Array()
+		{
+			data.ReplicatorId.ToByteArray(),
+			data.FieldMask,
+			new Godot.Collections.Array(
+				Enumerable.Range(0, 32)
+					.Where(i => (data.FieldMask & (1u << i)) != 0)
+					.Select(i => data.Values[i])
+					.ToArray()
+			),
+		};
+
 	public ReplicationData(Guid replicatorId) => this.ReplicatorId = replicatorId;
 	public ReplicationData(Guid replicatorId, uint fieldMask, Variant[] values)
 	{
@@ -16,6 +42,10 @@ public class ReplicationData
 		this.FieldMask = fieldMask;
 		this.Values = values;
 	}
+
+	// -----------------------------------------------------------------------------------------------------------------
+	// FIELDS
+	// -----------------------------------------------------------------------------------------------------------------
 
 	/// <summary>
 	/// The unique cross-network identifier of the MultiplayerReplicator that should handle this replication data.
@@ -35,6 +65,16 @@ public class ReplicationData
 	/// this array. The length of the array is equal to the number of set bits in the <see cref="FieldMask"/>.
 	/// </summary>
 	public Variant[] Values { get; private set; } = new Variant[32];
+
+	// -----------------------------------------------------------------------------------------------------------------
+	// PROPERTIES
+	// -----------------------------------------------------------------------------------------------------------------
+
+	public int FieldCount => BitOperations.PopCount(this.FieldMask);
+
+	// -----------------------------------------------------------------------------------------------------------------
+	// METHODS
+	// -----------------------------------------------------------------------------------------------------------------
 
 	/// <summary>
 	/// Merges replication data into this instance. The provided field mask and values are combined with the existing
@@ -80,23 +120,8 @@ public class ReplicationData
 	}
 
 	public Variant Serialize()
-		=> new Godot.Collections.Array()
-		{
-			this.ReplicatorId.ToByteArray(),
-			this.FieldMask,
-			new Godot.Collections.Array(
-				Enumerable.Range(0, 32)
-					.Where(i => (this.FieldMask & (1u << i)) != 0)
-					.Select(i => this.Values[i])
-					.ToArray()
-			),
-		};
+		=> ReplicationData.Serialize(this);
 
-	public static ReplicationData Deserialize(Variant data)
-	{
-		Guid replicatorId = new(data.AsGodotArray()[0].AsByteArray());
-		uint fieldMask = data.AsGodotArray()[1].AsUInt32();
-		Variant[] values = data.AsGodotArray()[2].AsGodotArray().ToArray();
-		return new(replicatorId, fieldMask, values);
-	}
+	public override string ToString()
+		=> $"{nameof(ReplicationData)} {new { this.FieldCount, this.ReplicatorId }}";
 }

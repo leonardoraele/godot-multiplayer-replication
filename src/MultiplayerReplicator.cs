@@ -47,7 +47,16 @@ public partial class MultiplayerReplicator : Node
 	/// the network. It is generated when the MultiplayerReplicator is created and remains constant throughout its
 	/// lifetime.
 	/// </summary>
-	public Guid ReplicatorId { get; init; } = Guid.NewGuid();
+	/// <remarks>
+	/// This field is exported so that it can be stored in the scene file and remain constant across game sessions; but
+	/// it is hidden in the editor and automatically generated when the MultiplayerReplicator is created. It should not
+	/// be modified by the user.
+	/// </remarks>
+	[Export] private string SerializedReplicatorId
+	{
+		get => this.ReplicatorId.ToString();
+		set => this.ReplicatorId = Guid.TryParse(value, out Guid guid) ? guid : Guid.Empty;
+	}
 
 	/// <summary>
 	/// Stores the values of the replicated fields in the same order as the <see cref="ReplicatedFields"/> array.
@@ -57,29 +66,29 @@ public partial class MultiplayerReplicator : Node
 	{
 		get
 		{
-			if (field == null || this.ReplicatedFields.Count != field.Length) {
-				field = this.ReplicatedFields
-					.Select(fieldName => this.ParentCache.GetIndexed(fieldName))
-					.ToArray();
-				this.MarkAllFieldsDirty();
-			}
+			if (field == null || this.ReplicatedFields.Count != field.Length)
+				field = new Variant[this.ReplicatedFields.Count];
 			return field;
 		}
 	}
 
-	/// <summary>
-	/// Bitmask that marks the fields that have changed since the last time they were sent to the peers.
-	/// </summary>
-	private uint DirtyFieldsMask = 0u;
+	// /// <summary>
+	// /// Bitmask that marks the fields that have changed since the last time they were sent to the peers.
+	// /// </summary>
+	// private uint DirtyFieldsMask = 0u;
 
 	/// <summary>
 	/// Holds a reference to the parent node so that we don't need to call godot api every frame.
 	/// </summary>
-	private Node ParentCache => field ??= this.GetParent();
+	private Node ParentCache => Engine.IsEditorHint()
+		? this.GetParent()
+		: (field ??= this.GetParent());
 
 	// -----------------------------------------------------------------------------------------------------------------
 	// PROPERTIES
 	// -----------------------------------------------------------------------------------------------------------------
+
+	public Guid ReplicatorId = Guid.NewGuid();
 
 	// -----------------------------------------------------------------------------------------------------------------
 	// SIGNALS
@@ -100,12 +109,16 @@ public partial class MultiplayerReplicator : Node
 	{
 		base._ValidateProperty(property);
 		switch (property["name"].AsString()) {
-			case nameof(ReplicatedFields):
-				string propNames = this.ParentCache.GetPropertyList()
+			case nameof(this.SerializedReplicatorId):
+				property["usage"] = (long) PropertyUsageFlags.Storage;
+				break;
+			case nameof(this.ReplicatedFields):
+				string propNames = this.ParentCache?.GetPropertyList()
 					.Where(prop => (prop["usage"].AsInt64() & (long) PropertyUsageFlags.Storage) != 0)
 					.Select(prop => prop["name"].AsString())
 					.ToArray()
-					.Join(",");
+					.Join(",")
+					?? "";
 				property["type"] = (long) Variant.Type.Array;
 				property["hint"] = (long) PropertyHint.ArrayType;
 				property["hint_string"] = $"{Variant.Type.String:D}/{PropertyHint.EnumSuggestion:D}:{propNames}";
@@ -117,20 +130,23 @@ public partial class MultiplayerReplicator : Node
 	{
 		base._EnterTree();
 		this.AddToGroup(GROUP_NAME);
+		if (Engine.IsEditorHint())
+			return;
 		ReplicationManager.Instance.RegisterReplicator(this);
 	}
 
     public override void _ExitTree()
 	{
 		base._ExitTree();
+		if (Engine.IsEditorHint())
+			return;
 		ReplicationManager.Instance.UnregisterReplicator(this);
 	}
 
-	public override void _Ready()
-	{
-		base._Ready();
-		this.MarkAllFieldsDirty();
-	}
+	// public override void _Ready()
+	// {
+	// 	base._Ready();
+	// }
 
 	// public override void _Process(double delta)
 	// {
@@ -146,41 +162,35 @@ public partial class MultiplayerReplicator : Node
 	// 	=> base._PhysicsProcess(delta);
 
 	// -----------------------------------------------------------------------------------------------------------------
-	// DIRTY FIELD HELPER METHODS
-	// -----------------------------------------------------------------------------------------------------------------
-
-	private bool IsFieldDirty(int index) => (this.DirtyFieldsMask & (1u << index)) != 0;
-	private bool HasDirtyFields() => this.DirtyFieldsMask != 0;
-
-	private void MarkFieldDirty(int index) => this.MarkFieldsDirty(1u << index);
-	private void MarkAllFieldsDirty()
-	{
-		for (int i = 0; i < ReplicatedFields.Count; i++)
-			this.MarkFieldDirty(i);
-	}
-	private void MarkFieldsDirty(uint bitmask) => this.DirtyFieldsMask |= bitmask;
-	private void MarkFieldsClean(uint bitmask) => this.DirtyFieldsMask &= ~bitmask;
-
-	private IEnumerable<string> GetFieldNames(uint bitmask) => this.ReplicatedFields
-		.Where((_, index) => (bitmask & (1u << index)) != 0);
-	private IEnumerable<string> GetDirtyFieldNames() => this.GetFieldNames(this.DirtyFieldsMask);
-	private IEnumerable<Variant> GetDirtyFieldValues() => this.GetDirtyFieldNames()
-		.Select(field => this.ParentCache.GetIndexed(field));
-
-
-	// -----------------------------------------------------------------------------------------------------------------
 	// METHODS
 	// -----------------------------------------------------------------------------------------------------------------
 
-	public bool TryGetReplicationData([NotNullWhen(true)] out ReplicationData? data)
+	private IEnumerable<string> GetFieldNames(uint bitmask) => this.ReplicatedFields
+		.Where((_, index) => (bitmask & (1u << index)) != 0);
+
+	/// <summary>
+	/// Gets the next replication data to be sent to the peers, if available. The replication data contains the values
+	/// of the replicated fields that changed since this method was last called, in a packed format to be sent to the
+	/// peers for state replication. The first time this method is called, it should contain replication data for all of
+	/// the replicated fields.
+	///
+	/// This method returns false and the out parameter set to null if the multiplayer authority peer has no dirty
+	/// fields or if this peer is not the multiplayer authority for this node, signifying there is no data to be
+	/// transmitted by this host to other peers. The multiplayer authority peer is the only peer that should send
+	/// replication data to the others.
+	/// </summary>
+	/// <param name="data">The replication data to be sent to the peers.</param>
+	/// <returns>True if there is replication data to be sent, false otherwise.</returns>
+	public bool TryGetNextReplicationData([NotNullWhen(true)] out ReplicationData? data)
 	{
-		if (this.IsMultiplayerAuthority())
-		{
-			this.UpdateDirtiness();
-			data = new(this.ReplicatorId, this.DirtyFieldsMask, this.GetDirtyFieldValues().ToArray());
-		}
-		else
-			data = null;
+		data = null;
+		if (!this.IsMultiplayerAuthority())
+			return false;
+		uint dirtyFields = this.GetNextDirtyFields();
+		if (dirtyFields == 0u)
+			return false;
+		data = new(this.ReplicatorId, dirtyFields, [..this.ReplicatedFieldsCache]);
+		// GD.PrintS(nameof(MultiplayerReplicator), this.Multiplayer.GetUniqueId(), $"Generated replication data for \"{this.ParentCache.Name}\" ({string.Join(", ", this.GetFieldNames(data.FieldMask))})");
 		return data != null;
 	}
 
@@ -188,15 +198,17 @@ public partial class MultiplayerReplicator : Node
 	/// Updates the dirtiness of all fields; i.e. marks them as dirty if their values have changed since the last time
 	/// this method was called.
 	/// </summary>
-	private void UpdateDirtiness()
+	private uint GetNextDirtyFields()
 	{
 		// No need to update dirtiness if we are not the multiplayer authority, because only the multiplayer authority
 		// should send replication data to the other peers. The other peers will receive the replication data from the
 		// multiplayer authority and update their local values accordingly.
 		if (!this.IsMultiplayerAuthority())
-			return;
-		for (int i = 0; i < this.ReplicatedFields.Count; i++)
-			this.UpdateFieldDirtiness(i);
+			return 0u;
+		return Enumerable.Range(0, this.ReplicatedFields.Count)
+			.Where(this.GetNextFieldDirtiness)
+			.Select(index => 1u << index)
+			.Aggregate(0u, (acc, value) => acc | value);
 	}
 
 	/// <summary>
@@ -204,16 +216,17 @@ public partial class MultiplayerReplicator : Node
 	/// method was called. Returns true if the field was marked as dirty, false otherwise.
 	/// </summary>
 	/// <returns>True if the field is dirty.</returns>
-	private void UpdateFieldDirtiness(int index)
+	private bool GetNextFieldDirtiness(int index)
 	{
-		if (this.IsFieldDirty(index))
-			return;
-		string field = this.ReplicatedFields[index];
-		Variant currentValue = this.ParentCache.GetIndexed(field);
-		bool fieldChanged = !currentValue.Equals(this.ReplicatedFieldsCache[index]);
-		this.ReplicatedFieldsCache[index] = currentValue;
-		if (fieldChanged)
-			this.MarkFieldDirty(index);
+		string fieldName = this.ReplicatedFields[index];
+		Variant currentValue = this.ParentCache.GetIndexed(fieldName);
+		// GD.PrintS(nameof(MultiplayerReplicator), nameof(GetNextFieldDirtiness), this.Multiplayer.GetUniqueId(), new { fieldName, currentValue, cachedValue = this.ReplicatedFieldsCache[index], equals = currentValue.Equals(this.ReplicatedFieldsCache[index]) });
+		if (!currentValue.Equals(this.ReplicatedFieldsCache[index]))
+		{
+			this.ReplicatedFieldsCache[index] = currentValue;
+			return true;
+		}
+		return false;
 	}
 
 	/// <summary>
@@ -222,11 +235,11 @@ public partial class MultiplayerReplicator : Node
 	/// </summary>
 	public void AcceptReplicationData(ReplicationData data)
 	{
+		GD.PrintS(nameof(MultiplayerReplicator), this.Multiplayer.GetUniqueId(), $"Received replication data for \"{this.ParentCache.Name}\" ({string.Join(", ", this.GetFieldNames(data.FieldMask))})");
 		string[] fieldNames = this.GetFieldNames(data.FieldMask).ToArray();
 		Debug.Assert(fieldNames.Length == data.Values.Length, "Field names and values arrays must have the same length.");
-		for (int i = 0; i < data.Values.Length; i++) {
+		for (int i = 0; i < data.Values.Length; i++)
 			this.ParentCache.SetIndexed(fieldNames[i], data.Values[i]);
-		}
 	}
 
 	// private void OnPeerChangedInterest(ConnectedPeer peer)

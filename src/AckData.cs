@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Numerics;
 using Godot;
 
 namespace Raele.MultiplayerReplication;
@@ -13,6 +14,7 @@ public record AckData(Guid ReplicatorId, uint FieldMask)
 		=> new(this.ReplicatorId, this.FieldMask & ~fieldMask);
 
 	public bool Empty => this.FieldMask == 0u;
+	public int FieldCount => BitOperations.PopCount(this.FieldMask);
 
 	public Variant Serialize()
 		=> new Godot.Collections.Array()
@@ -29,4 +31,7 @@ public record AckData(Guid ReplicatorId, uint FieldMask)
 		uint fieldMask = array[1].AsUInt32();
 		return new(replicatorId, fieldMask);
 	}
+
+	public override string ToString()
+		=> $"{nameof(AckData)} {new { this.FieldCount, this.ReplicatorId }}";
 }

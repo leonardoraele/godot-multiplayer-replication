@@ -43,13 +43,22 @@ public partial class ReplicationManager : Node
 	/// <summary>
 	/// Maps peer id to peer controller. The controller holds replication information for the peer.
 	/// </summary>
-	private Dictionary<long, PeerController> PeerControllers = new();
+	private Dictionary<long, ConnectedPeer> ConnectedPeers = new();
 
 	/// <summary>
 	/// Holds a reference to all MultiplayerReplicator nodes in the scene tree, indexed by their unique network id. This
 	/// allows for quick lookup of replicators when processing replication data.
 	/// </summary>
 	private Dictionary<Guid, MultiplayerReplicator> Replicators = new();
+
+	/// <summary>
+	/// A preconstructed callable for the <see cref="UpdateReplication"/> method. This is useful because this method is
+	/// called every frame, and creating a new callable every frame would be inefficient. Instead, we create it once and
+	/// reuse it.
+	/// </summary>
+	private Callable UpdateReplicationCallable => field.Target == null
+		? (field = Callable.From(this.UpdateReplication))
+		: field;
 
     // -----------------------------------------------------------------------------------------------------------------
     // PROPERTIES
@@ -105,7 +114,7 @@ public partial class ReplicationManager : Node
 	public override void _Process(double delta)
 	{
 		base._Process(delta);
-		this.UpdateReplication();
+		this.UpdateReplicationCallable.CallDeferred();
 	}
 
 	// public override void _PhysicsProcess(double delta)
@@ -126,14 +135,14 @@ public partial class ReplicationManager : Node
 		ENetMultiplayerPeer peer = new();
 		peer.CreateServer(port);
 		this.Multiplayer.MultiplayerPeer = peer;
-		GD.PrintS(this.Multiplayer.MultiplayerPeer.GetUniqueId(), nameof(ReplicationManager), "🌐 Server started.", new { port });
+		GD.PrintS(nameof(ReplicationManager), this.Multiplayer.MultiplayerPeer.GetUniqueId(), "🌐 Server started.", new { port });
 		this.EmitSignal(SignalName.ServerStarted);
 	}
 
 	public async Task ConnectToServer(string address, int port = DEFAULT_PORT)
 	{
 		this.Disconnect();
-		GD.PrintS(this.Multiplayer.MultiplayerPeer.GetUniqueId(), nameof(ReplicationManager), "🌐 Connecting to server...", new { address, port });
+		GD.PrintS(nameof(ReplicationManager), this.Multiplayer.MultiplayerPeer.GetUniqueId(), "🌐 Connecting to server...", new { address, port });
 		ENetMultiplayerPeer peer = new();
 		peer.CreateClient(address, port);
 		this.Multiplayer.MultiplayerPeer = peer;
@@ -161,27 +170,27 @@ public partial class ReplicationManager : Node
 
     private void OnPeerConnected(long peerId)
 	{
-		GD.PrintS(this.Multiplayer.MultiplayerPeer.GetUniqueId(), nameof(ReplicationManager), $"🌐 Peer #{peerId} connected.");
-		this.PeerControllers[peerId] = new PeerController(peerId);
+		GD.PrintS(nameof(ReplicationManager), this.Multiplayer.MultiplayerPeer.GetUniqueId(), $"🌐 Peer #{peerId} connected.");
+		this.ConnectedPeers[peerId] = new ConnectedPeer(peerId);
 		this.EmitSignal(SignalName.PeerConnected, peerId);
 	}
 
 	private void OnPeerDisconnected(long peerId)
 	{
-		GD.PrintS(this.Multiplayer.MultiplayerPeer.GetUniqueId(), nameof(ReplicationManager), $"🌐 Peer #{peerId} disconnected.");
-		this.PeerControllers.Remove(peerId);
+		GD.PrintS(nameof(ReplicationManager), this.Multiplayer.MultiplayerPeer.GetUniqueId(), $"🌐 Peer #{peerId} disconnected.");
+		this.ConnectedPeers.Remove(peerId);
 		this.EmitSignal(SignalName.PeerDisconnected, peerId);
 	}
 
 	private void OnConnectedToServer()
 	{
-		GD.PrintS(this.Multiplayer.MultiplayerPeer.GetUniqueId(), nameof(ReplicationManager), "🌐 Connected to server.");
+		GD.PrintS(nameof(ReplicationManager), this.Multiplayer.MultiplayerPeer.GetUniqueId(), "🌐 Connected to server.");
 		this.EmitSignal(SignalName.ConnectedToServer);
 	}
 
 	private void OnDisconnectedFromServer()
 	{
-		GD.PrintS(this.Multiplayer.MultiplayerPeer.GetUniqueId(), nameof(ReplicationManager), "🌐 Disconnected from server.");
+		GD.PrintS(nameof(ReplicationManager), this.Multiplayer.MultiplayerPeer.GetUniqueId(), "🌐 Disconnected from server.");
 		this.EmitSignal(SignalName.DisconnectedFromServer);
 	}
 
@@ -200,14 +209,14 @@ public partial class ReplicationManager : Node
 
 	private void StopMultiplayerServer()
 	{
-		GD.PrintS(this.Multiplayer.MultiplayerPeer.GetUniqueId(), nameof(ReplicationManager), "🌐 Server stopped.");
+		GD.PrintS(nameof(ReplicationManager), this.Multiplayer.MultiplayerPeer.GetUniqueId(), "🌐 Server stopped.");
 		this.BaseDisconnect();
 		this.EmitSignal(SignalName.ServerStopped);
 	}
 
 	private void DisconnectFromServer()
 	{
-		GD.PrintS(this.Multiplayer.MultiplayerPeer.GetUniqueId(), nameof(ReplicationManager), "🌐 Disconnected from server.");
+		GD.PrintS(nameof(ReplicationManager), this.Multiplayer.MultiplayerPeer.GetUniqueId(), "🌐 Disconnected from server.");
 		this.BaseDisconnect();
 		this.EmitSignal(SignalName.DisconnectedFromServer);
 	}
@@ -216,11 +225,11 @@ public partial class ReplicationManager : Node
 	{
 		this.Multiplayer.MultiplayerPeer?.Close();
 		this.Multiplayer.MultiplayerPeer = new OfflineMultiplayerPeer();
-		this.PeerControllers.Clear();
+		this.ConnectedPeers.Clear();
 	}
 
 	// -----------------------------------------------------------------------------------------------------------------
-	// REPLICATION METHODS
+	// INTEREST MANAGEMENT METHODS
 	// -----------------------------------------------------------------------------------------------------------------
 
 	/// <summary>
@@ -233,7 +242,7 @@ public partial class ReplicationManager : Node
 		if (this.ConnectionStatus == MultiplayerPeer.ConnectionStatus.Disconnected)
 			return;
 		if (this.Multiplayer.IsServer())
-			if (this.PeerControllers.TryGetValue(peerId, out PeerController? peer))
+			if (this.ConnectedPeers.TryGetValue(peerId, out ConnectedPeer? peer))
 				peer.Interests.Permitted = new HashSet<string>(peer.Interests.Permitted) { group };
 		else
 			if (peerId == this.Multiplayer.GetUniqueId())
@@ -245,7 +254,7 @@ public partial class ReplicationManager : Node
 	{
 		long peerId = this.Multiplayer.GetRemoteSenderId();
 		Debug.Assert(this.Multiplayer.IsServer(), $"Received {nameof(this.RpcAddInterest)} RPC on a non-server peer.");
-		if (this.PeerControllers.TryGetValue(peerId, out PeerController? peer))
+		if (this.ConnectedPeers.TryGetValue(peerId, out ConnectedPeer? peer))
 			peer.Interests.Requested = new HashSet<string>(peer.Interests.Requested) { group };
 	}
 
@@ -257,7 +266,7 @@ public partial class ReplicationManager : Node
 	public void RemoveInterest(long peerId, string group)
 	{
 		if (this.Multiplayer.IsServer())
-			if (this.PeerControllers.TryGetValue(peerId, out PeerController? peer))
+			if (this.ConnectedPeers.TryGetValue(peerId, out ConnectedPeer? peer))
 				peer.Interests.Permitted = new HashSet<string>(peer.Interests.Permitted).Except([group]).ToHashSet();
 		else
 			if (peerId == this.Multiplayer.GetUniqueId())
@@ -269,9 +278,13 @@ public partial class ReplicationManager : Node
 	{
 		long peerId = this.Multiplayer.GetRemoteSenderId();
 		Debug.Assert(this.Multiplayer.IsServer(), $"Received {nameof(this.RpcRemoveInterest)} RPC on a non-server peer.");
-		if (this.PeerControllers.TryGetValue(peerId, out PeerController? peer))
+		if (this.ConnectedPeers.TryGetValue(peerId, out ConnectedPeer? peer))
 			peer.Interests.Requested = new HashSet<string>(peer.Interests.Requested).Except([group]).ToHashSet();
 	}
+
+	// -----------------------------------------------------------------------------------------------------------------
+	// REPLICATION METHODS
+	// -----------------------------------------------------------------------------------------------------------------
 
 	/// <summary>
 	/// Updates the replication data for all peers. This method is called every frame. It sends replication data to all
@@ -289,17 +302,20 @@ public partial class ReplicationManager : Node
 
 		// Update replication data for all replicators and enqueue it for all peers.
 		foreach(MultiplayerReplicator replicator in this.Replicators.Values)
-			if (replicator.TryGetReplicationData(out ReplicationData? data))
-				foreach (PeerController peer in this.PeerControllers.Values)
-					peer.PutReplicationData(data);
+			if (replicator.TryGetNextReplicationData(out ReplicationData? data))
+				foreach (ConnectedPeer peer in this.ConnectedPeers.Values)
+					peer.EnqueueReplicationData(data);
 
 		// Send replication packets to all peers. The replication packet contains both replication data and
 		// acknowledgment data enqueued to be sent to that peer.
-		foreach (PeerController peer in this.PeerControllers.Values)
+		foreach (ConnectedPeer peer in this.ConnectedPeers.Values)
 		{
 			ReplicationPacket packet = peer.CreateReplicationPacket(clearAckQueue: true);
 			if (!packet.Empty)
-				this.RpcId(peer.PeerId, MethodName.RpcAcceptReplicationData, packet.Serialize());
+			{
+				this.RpcId(peer.PeerId, MethodName.RpcAcceptReplicationData, ReplicationPacket.Serialize(packet));
+				// GD.PrintS(nameof(ReplicationManager), this.Multiplayer.GetUniqueId(), $"📨 Replication packet sent.", new { Recipient = peer.PeerId, packet });
+			}
 		}
 	}
 
@@ -309,19 +325,21 @@ public partial class ReplicationManager : Node
 		// If we don't have a peer controller for the sender, we can't process the replication data. This can happen if
 		// the peer controller was removed due to a disconnect, but the replication packet was still in transit. In this
 		// case, we just ignore the replication data.
-		if (!this.PeerControllers.TryGetValue(this.Multiplayer.GetRemoteSenderId(), out PeerController? peer))
+		if (!this.ConnectedPeers.TryGetValue(this.Multiplayer.GetRemoteSenderId(), out ConnectedPeer? peer))
 			return;
 
 		ReplicationPacket packet = ReplicationPacket.Deserialize(serializedPacket);
 
+		// GD.PrintS(nameof(ReplicationManager), this.Multiplayer.GetUniqueId(), $"📩 Replication packet received.", new { Sender = peer.PeerId, packet });
+
 		// Clear replication data for the acknowledged fields, so that we stop sending the data in the next packets.
 		foreach (AckData ack in packet.AckData)
-			peer.ClearReplicationData(ack.ReplicatorId, ack.FieldMask);
+			peer.AcceptAck(ack);
 
 		// Deliver replication data to the appropriate replicators.
 		foreach (ReplicationData data in packet.ReplicationData)
 		{
-			peer.PutAck(new(data.ReplicatorId, data.FieldMask));
+			peer.EnqueueAck(new(data.ReplicatorId, data.FieldMask));
 			if (!this.Replicators.TryGetValue(data.ReplicatorId, out MultiplayerReplicator? replicator))
 				continue;
 			long expectedSender = this.Multiplayer.IsServer()
