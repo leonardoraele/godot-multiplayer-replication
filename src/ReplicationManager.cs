@@ -359,4 +359,14 @@ public partial class ReplicationManager : Node
 
 	public void UnregisterReplicator(MultiplayerReplicator replicator)
 		=> this.Replicators.Remove(replicator.ReplicatorId);
+
+	public TimeSpan GetReplicationInterpolationTime(Node node)
+		=> this.GetReplicationInterpolationTime(node.GetMultiplayerAuthority());
+	public TimeSpan GetReplicationInterpolationTime(int authority)
+	{
+		if (this.Multiplayer.MultiplayerPeer is not ENetMultiplayerPeer peer)
+			return TimeSpan.Zero;
+		double rtt = peer.GetPeer(authority).GetStatistic(ENetPacketPeer.PeerStatistic.RoundTripTime);
+		return TimeSpan.FromMilliseconds(rtt / 2);
+	}
 }

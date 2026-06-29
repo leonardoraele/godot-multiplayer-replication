@@ -38,6 +38,8 @@ public partial class MultiplayerReplicator : Node
 	/// </summary>
 	[Export] public Godot.Collections.Array<string> ReplicatedFields = [];
 
+	[Export] public bool Interpolate = true;
+
 	// -----------------------------------------------------------------------------------------------------------------
 	// FIELDS
 	// -----------------------------------------------------------------------------------------------------------------
@@ -88,6 +90,9 @@ public partial class MultiplayerReplicator : Node
 	// PROPERTIES
 	// -----------------------------------------------------------------------------------------------------------------
 
+	/// <summary>
+	/// The unique identifier for this MultiplayerReplicator across hosts.
+	/// </summary>
 	public Guid ReplicatorId = Guid.NewGuid();
 
 	// -----------------------------------------------------------------------------------------------------------------
@@ -239,7 +244,19 @@ public partial class MultiplayerReplicator : Node
 		string[] fieldNames = this.GetFieldNames(data.FieldMask).ToArray();
 		Debug.Assert(fieldNames.Length == data.Values.Length, "Field names and values arrays must have the same length.");
 		for (int i = 0; i < data.Values.Length; i++)
-			this.ParentCache.SetIndexed(fieldNames[i], data.Values[i]);
+			this.AcceptNewFieldValue(this.ParentCache, fieldNames[i], data.Values[i]);
+	}
+
+	private void AcceptNewFieldValue(Node node, string fieldName, Variant newValue)
+	{
+		if (!this.Interpolate)
+		{
+			node.SetIndexed(fieldName, newValue);
+			return;
+		}
+		Tween tween = this.CreateTween();
+		double duration = ReplicationManager.Instance.GetReplicationInterpolationTime(this).TotalSeconds;
+		tween.TweenProperty(node, fieldName, newValue, duration);
 	}
 
 	// private void OnPeerChangedInterest(ConnectedPeer peer)
