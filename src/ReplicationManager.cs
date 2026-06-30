@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Threading.Tasks;
 using Godot;
+using Raele.GodotUtils.Extensions;
 
 namespace Raele.MultiplayerReplication;
 
@@ -310,7 +311,7 @@ public partial class ReplicationManager : Node
 		// acknowledgment data enqueued to be sent to that peer.
 		foreach (ConnectedPeer peer in this.ConnectedPeers.Values)
 		{
-			ReplicationPacket packet = peer.CreateReplicationPacket(clearAckQueue: true);
+			ReplicationPacket packet = peer.CreateNextReplicationPacket();
 			if (!packet.Empty)
 			{
 				this.RpcId(peer.PeerId, MethodName.RpcAcceptReplicationData, ReplicationPacket.Serialize(packet));
@@ -355,10 +356,24 @@ public partial class ReplicationManager : Node
 	}
 
 	public void RegisterReplicator(MultiplayerReplicator replicator)
-		=> this.Replicators[replicator.ReplicatorId] = replicator;
+	{
+		this.Replicators[replicator.UniqueId] = replicator;
+		if (replicator.ReplicateChildSpawns && replicator.IsMultiplayerAuthority())
+			this.Rpc(MethodName.RpcSpawn, replicator.Root!.SceneFilePath, replicator.Root!.GetPath());
+	}
+
+	[Rpc(MultiplayerApi.RpcMode.AnyPeer)]
+	public void RpcSpawn()
+	{
+
+	}
 
 	public void UnregisterReplicator(MultiplayerReplicator replicator)
-		=> this.Replicators.Remove(replicator.ReplicatorId);
+	{
+		this.Replicators.Remove(replicator.UniqueId);
+		if (replicator.ReplicateDespawns)
+			this.ConnectedPeers.Values.ForEach(peer => peer.EnqueueDespawn(replicator.UniqueId));
+	}
 
 	public TimeSpan GetReplicationInterpolationTime(Node node)
 		=> this.GetReplicationInterpolationTime(node.GetMultiplayerAuthority());

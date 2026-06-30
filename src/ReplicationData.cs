@@ -119,9 +119,6 @@ public class ReplicationData
 		return this.FieldMask == 0;
 	}
 
-	public Variant Serialize()
-		=> ReplicationData.Serialize(this);
-
 	public override string ToString()
 		=> $"{nameof(ReplicationData)} {new { this.FieldCount, this.ReplicatorId }}";
 }

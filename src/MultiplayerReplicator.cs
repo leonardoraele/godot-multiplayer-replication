@@ -5,14 +5,16 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using Godot;
+using Raele.GodotUtils.Extensions;
+using static Godot.SceneReplicationConfig;
 
 namespace Raele.MultiplayerReplication;
 
 /// <summary>
-/// The MultiplayerReplicator tracks the replicated fields of its parent node. When the fields change on the multiplayer
+/// The MultiplayerReplicator tracks the replicated fields of a target node. When the fields change on the multiplayer
 /// authority peer, they are automatically replicated to the interested peers.
 ///
-/// The MultiplayerReplicator also makes sure its parent node is correctly spawned and despawned on all peers when it
+/// The MultiplayerReplicator also makes sure the target node is correctly spawned and despawned on all peers when it
 /// enters or leaves the scene tree.
 /// </summary>
 [Tool][GlobalClass]
@@ -29,16 +31,58 @@ public partial class MultiplayerReplicator : Node
 	// -----------------------------------------------------------------------------------------------------------------
 
 	/// <summary>
+	/// Determines the node that owns the properties to be replicated.
+	/// </summary>
+	[Export] public Node? Root
+	{
+		get => field ?? this.Owner;
+		set {
+			this.MigrateReplicatedFieldPaths(field, value);
+			field = value;
+			this.UpdateConfigurationWarnings();
+			this.NotifyPropertyListChanged();
+		}
+	}
+
+	[ExportGroup("Property Replication")]
+	/// <summary>
 	/// A list of field names to replicate, separated by comma. This MultiplayerReplicator will replicate these fields
 	/// in addition to the fields marked with the [Replicated] attribute.
 	///
-	/// Each entry of this list can be a direct property of the replicated node (i.e. the parent of this node) or a
+	/// Each entry of this list can be a direct property of the replicated node (i.e. the target node) or a
 	/// property path to a nested field, using NodePath notation. For example, ":position:x" will replicate only the X
 	/// component of the replicated node's `position` property.
 	/// </summary>
 	[Export] public Godot.Collections.Array<string> ReplicatedFields = [];
 
-	[Export] public bool Interpolate = true;
+	[ExportToolButton("Add Property...")] public Callable AddReplicationFieldButton
+		=> Callable.From(this.OnAddReplicationFieldButtonPressed);
+
+	[ExportSubgroup("Additional Options")]
+	/// <summary>
+	/// If true, the replicated fields will be interpolated when they are updated on the peers. If false, the fields
+	/// will be updated immediately to the newly received values. Interpolation is useful for smooth movement of
+	/// objects, but it can introduce a small delay.
+	/// </summary>
+	[Export] public bool InterpolateValues = true;
+	[Export] public ReplicationMode ReplicationStrategy = ReplicationMode.OnChange; // TODO This is not implemented yet. For now, all replication is done on change.
+
+	[ExportGroup("Replicate Child Spawns")]
+	/// <summary>
+	/// If this is true, when the parent node enters the scene tree, this MultiplayerReplicator will automatically
+	/// notify the interested peers so that they also instantiate the same scene in the same path.
+	/// the target node.
+	/// </summary>
+	[Export(PropertyHint.GroupEnable)] public bool ReplicateChildSpawns = false;
+
+	[Export] public string[] SceneSpawnWhitelist = [];
+
+	/// <summary>
+	/// Similarly to <see cref="ReplicateChildSpawns"/>, if this is true, when the parent node exits the scene tree, this
+	/// MultiplayerReplicator will automatically notify the interested peers so that they also remove their version of
+	/// the target node.
+	/// </summary>
+	[Export] public bool ReplicateDespawns = true;
 
 	// -----------------------------------------------------------------------------------------------------------------
 	// FIELDS
@@ -56,8 +100,8 @@ public partial class MultiplayerReplicator : Node
 	/// </remarks>
 	[Export] private string SerializedReplicatorId
 	{
-		get => this.ReplicatorId.ToString();
-		set => this.ReplicatorId = Guid.TryParse(value, out Guid guid) ? guid : Guid.Empty;
+		get => this.UniqueId.ToString();
+		set => this.UniqueId = Guid.TryParse(value, out Guid guid) ? guid : Guid.Empty;
 	}
 
 	/// <summary>
@@ -74,18 +118,6 @@ public partial class MultiplayerReplicator : Node
 		}
 	}
 
-	// /// <summary>
-	// /// Bitmask that marks the fields that have changed since the last time they were sent to the peers.
-	// /// </summary>
-	// private uint DirtyFieldsMask = 0u;
-
-	/// <summary>
-	/// Holds a reference to the parent node so that we don't need to call godot api every frame.
-	/// </summary>
-	private Node ParentCache => Engine.IsEditorHint()
-		? this.GetParent()
-		: (field ??= this.GetParent());
-
 	// -----------------------------------------------------------------------------------------------------------------
 	// PROPERTIES
 	// -----------------------------------------------------------------------------------------------------------------
@@ -93,7 +125,7 @@ public partial class MultiplayerReplicator : Node
 	/// <summary>
 	/// The unique identifier for this MultiplayerReplicator across hosts.
 	/// </summary>
-	public Guid ReplicatorId = Guid.NewGuid();
+	public Guid UniqueId = Guid.NewGuid();
 
 	// -----------------------------------------------------------------------------------------------------------------
 	// SIGNALS
@@ -118,8 +150,8 @@ public partial class MultiplayerReplicator : Node
 				property["usage"] = (long) PropertyUsageFlags.Storage;
 				break;
 			case nameof(this.ReplicatedFields):
-				string propNames = this.ParentCache?.GetPropertyList()
-					.Where(prop => (prop["usage"].AsInt64() & (long) PropertyUsageFlags.Storage) != 0)
+				string propNames = (this.Root == this ? [] : this.Root?.GetPropertyList())
+					?.Where(prop => (prop["usage"].AsInt64() & (long) PropertyUsageFlags.Storage) != 0)
 					.Select(prop => prop["name"].AsString())
 					.ToArray()
 					.Join(",")
@@ -131,12 +163,19 @@ public partial class MultiplayerReplicator : Node
 		}
 	}
 
+	public override string[] _GetConfigurationWarnings()
+		=> (base._GetConfigurationWarnings() ?? [])
+			.AppendIf(this.Root == null, $"The mandatory field '{nameof(this.Root)}' is not set.")
+			.ToArray();
+
 	public override void _EnterTree()
 	{
 		base._EnterTree();
 		this.AddToGroup(GROUP_NAME);
 		if (Engine.IsEditorHint())
 			return;
+		if (this.ReplicateChildSpawns)
+			this.UniqueId = Guid.NewGuid();
 		ReplicationManager.Instance.RegisterReplicator(this);
 	}
 
@@ -194,8 +233,8 @@ public partial class MultiplayerReplicator : Node
 		uint dirtyFields = this.GetNextDirtyFields();
 		if (dirtyFields == 0u)
 			return false;
-		data = new(this.ReplicatorId, dirtyFields, [..this.ReplicatedFieldsCache]);
-		// GD.PrintS(nameof(MultiplayerReplicator), this.Multiplayer.GetUniqueId(), $"Generated replication data for \"{this.ParentCache.Name}\" ({string.Join(", ", this.GetFieldNames(data.FieldMask))})");
+		data = new(this.UniqueId, dirtyFields, [..this.ReplicatedFieldsCache]);
+		// GD.PrintS(nameof(MultiplayerReplicator), this.Multiplayer.GetUniqueId(), $"Generated replication data for \"{this.Target.Name}\" ({string.Join(", ", this.GetFieldNames(data.FieldMask))})");
 		return data != null;
 	}
 
@@ -208,7 +247,7 @@ public partial class MultiplayerReplicator : Node
 		// No need to update dirtiness if we are not the multiplayer authority, because only the multiplayer authority
 		// should send replication data to the other peers. The other peers will receive the replication data from the
 		// multiplayer authority and update their local values accordingly.
-		if (!this.IsMultiplayerAuthority())
+		if (!this.IsMultiplayerAuthority() || this.Root == null)
 			return 0u;
 		return Enumerable.Range(0, this.ReplicatedFields.Count)
 			.Where(this.GetNextFieldDirtiness)
@@ -223,8 +262,10 @@ public partial class MultiplayerReplicator : Node
 	/// <returns>True if the field is dirty.</returns>
 	private bool GetNextFieldDirtiness(int index)
 	{
+		if (this.Root == null)
+			return false;
 		string fieldName = this.ReplicatedFields[index];
-		Variant currentValue = this.ParentCache.GetIndexed(fieldName);
+		Variant currentValue = this.Root.GetIndexed(fieldName);
 		// GD.PrintS(nameof(MultiplayerReplicator), nameof(GetNextFieldDirtiness), this.Multiplayer.GetUniqueId(), new { fieldName, currentValue, cachedValue = this.ReplicatedFieldsCache[index], equals = currentValue.Equals(this.ReplicatedFieldsCache[index]) });
 		if (!currentValue.Equals(this.ReplicatedFieldsCache[index]))
 		{
@@ -240,23 +281,27 @@ public partial class MultiplayerReplicator : Node
 	/// </summary>
 	public void AcceptReplicationData(ReplicationData data)
 	{
-		GD.PrintS(nameof(MultiplayerReplicator), this.Multiplayer.GetUniqueId(), $"Received replication data for \"{this.ParentCache.Name}\" ({string.Join(", ", this.GetFieldNames(data.FieldMask))})");
+		if (this.Root == null)
+			return;
+		GD.PrintS(nameof(MultiplayerReplicator), this.Multiplayer.GetUniqueId(), $"Received replication data for \"{this.Root.Name}\" ({string.Join(", ", this.GetFieldNames(data.FieldMask))})");
 		string[] fieldNames = this.GetFieldNames(data.FieldMask).ToArray();
 		Debug.Assert(fieldNames.Length == data.Values.Length, "Field names and values arrays must have the same length.");
 		for (int i = 0; i < data.Values.Length; i++)
-			this.AcceptNewFieldValue(this.ParentCache, fieldNames[i], data.Values[i]);
+			this.AcceptNewFieldValue(fieldNames[i], data.Values[i]);
 	}
 
-	private void AcceptNewFieldValue(Node node, string fieldName, Variant newValue)
+	private void AcceptNewFieldValue(string fieldName, Variant newValue)
 	{
-		if (!this.Interpolate)
+		if (this.Root == null)
+			return;
+		if (!this.InterpolateValues)
 		{
-			node.SetIndexed(fieldName, newValue);
+			this.Root.SetIndexed(fieldName, newValue);
 			return;
 		}
 		Tween tween = this.CreateTween();
 		double duration = ReplicationManager.Instance.GetReplicationInterpolationTime(this).TotalSeconds;
-		tween.TweenProperty(node, fieldName, newValue, duration);
+		tween.TweenProperty(this.Root, fieldName, newValue, duration);
 	}
 
 	// private void OnPeerChangedInterest(ConnectedPeer peer)
@@ -279,4 +324,40 @@ public partial class MultiplayerReplicator : Node
 	// 	// 	this.RpcId(peer.Id, MethodName.RpcSetValues, uint.MaxValue, this.GetLocalValues(uint.MaxValue));
 	// 	// }
 	// }
+
+	private void OnAddReplicationFieldButtonPressed()
+	{
+		if (this.Root == null)
+		{
+			GD.PrintErr(nameof(MultiplayerReplicator), $"Cannot add replication field because the mandatory field '{nameof(this.Root)}' is not set.");
+			return;
+		}
+
+		EditorInterface.Singleton.PopupNodeSelector(Callable.From((NodePath path) =>
+		{
+			Node subject = this.Owner.GetNode(path);
+			EditorInterface.Singleton.PopupPropertySelector(subject, Callable.From((string property) =>
+			{
+				this.ReplicatedFields.Add($"{this.Root.GetPathTo(subject)}:{property}");
+				this.NotifyPropertyListChanged();
+			}));
+		}));
+	}
+
+	private void MigrateReplicatedFieldPaths(Node? oldTarget, Node? newTarget)
+	{
+		if (oldTarget == null || newTarget == null)
+			return;
+		this.ReplicatedFields = this.ReplicatedFields.Select(fieldPath =>
+			{
+				(string? nodePath, string? fieldName) = fieldPath.Split("::");
+				if (string.IsNullOrWhiteSpace(nodePath) || string.IsNullOrWhiteSpace(fieldName))
+					return fieldPath;
+				Node? subject = oldTarget.GetNode(nodePath);
+				if (subject == null)
+					return fieldPath;
+				return $"{newTarget.GetPathTo(subject)}::{fieldName}";
+			})
+			.ToGodotArrayT();
+	}
 }

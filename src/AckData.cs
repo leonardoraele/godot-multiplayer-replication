@@ -16,11 +16,11 @@ public record AckData(Guid ReplicatorId, uint FieldMask)
 	public bool Empty => this.FieldMask == 0u;
 	public int FieldCount => BitOperations.PopCount(this.FieldMask);
 
-	public Variant Serialize()
+	public static Variant Serialize(AckData data)
 		=> new Godot.Collections.Array()
 		{
-			this.ReplicatorId.ToByteArray(),
-			this.FieldMask,
+			data.ReplicatorId.ToByteArray(),
+			data.FieldMask,
 		};
 
 	public static AckData Deserialize(Variant data)

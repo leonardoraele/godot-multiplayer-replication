@@ -31,6 +31,9 @@ public class ConnectedPeer
 	/// </summary>
 	public readonly Dictionary<Guid, AckData> AckQueue = [];
 
+	public readonly List<SpawnData> SpawnQueue = [];
+	public readonly List<Guid> DespawnQueue = [];
+
 	/// <summary>
 	/// Adds replication data to the queue to be sent to the peer in the next replication packet. If there is already
 	/// replication data for the same replicator ID, the new replication data is merged with the existing one.
@@ -71,6 +74,33 @@ public class ConnectedPeer
 			this.ReplicationQueue.Remove(ack.ReplicatorId);
 	}
 
+	public AckData[] DequeueAcks()
+	{
+		AckData[] acks = this.AckQueue.Values.ToArray();
+		this.AckQueue.Clear();
+		return acks;
+	}
+
+	public void EnqueueSpawn(SpawnData spawn)
+		=> this.SpawnQueue.Add(spawn);
+
+	public SpawnData[] DequeueSpawns()
+	{
+		SpawnData[] spawns = this.SpawnQueue.ToArray();
+		this.SpawnQueue.Clear();
+		return spawns;
+	}
+
+	public void EnqueueDespawn(Guid replicatorId)
+		=> this.DespawnQueue.Add(replicatorId);
+
+	public Guid[] DequeueDespawns()
+	{
+		Guid[] despawns = this.DespawnQueue.ToArray();
+		this.DespawnQueue.Clear();
+		return despawns;
+	}
+
 	// /// <summary>
 	// /// Removes acknowledgment data from the queue for the specified replicator ID and field mask. This method should be
 	// /// called by the ReplicationManager when it receives acknowledgment data from the peer, so that we stop sending
@@ -91,19 +121,9 @@ public class ConnectedPeer
 	/// Creates a replication packet containing the replication data and acknowledgment data queued to be sent to this
 	/// peer.
 	/// </summary>
-	public ReplicationPacket CreateReplicationPacket(bool clearAckQueue = false)
-	{
-		ReplicationPacket packet = new(this.ReplicationQueue.Values.ToArray(), this.AckQueue.Values.ToArray());
-		if (clearAckQueue)
-			this.ClearAck();
-		return packet;
-	}
-
-	/// <summary>
-	/// Clears the acknowledgment queue. This method should be called by the ReplicationManager after it sends a packet
-	/// containing acknowledgment data to the peer, so that we don't send the same acknowledgment data again in the next
-	/// packet.
-	/// </summary>
-	public void ClearAck()
-		=> this.AckQueue.Clear();
+	public ReplicationPacket CreateNextReplicationPacket()
+		=> new(
+			this.ReplicationQueue.Values.ToArray(),
+			this.DequeueAcks()
+		);
 }

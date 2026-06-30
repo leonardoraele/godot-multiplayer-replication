@@ -52,3 +52,12 @@ Issues:
 	fields from the current value to the new values based on project settings.
 	- We could also have an export field in the `MultiplayerReplicator` node to override the project default replication
 		behavior for certain fields.
+
+### Scene Spawning
+
+- The `MultiplayerReplicator` node should have an export boolean called `Spawnable`.
+- When `MultiplayerReplicator` registers itself on the `ReplicationManager`, if it is `Spawnable`, the manager queues
+	a pawn message for every other peer to be sent in the next `ReplicationPacket`.
+- The packet should also contain the RID (or another reference) to the scene containing the `MultiplayerReplicator` and
+	the path where the scene is being added.
+- Upon receiving the packet, each peer instantiates the same scene and add it to the same path.
