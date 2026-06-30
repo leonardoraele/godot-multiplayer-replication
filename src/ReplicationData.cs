@@ -8,7 +8,7 @@ namespace Raele.MultiplayerReplication;
 /// <summary>
 /// Represents the replication data queued to update one specific object of a remote peer.
 /// </summary>
-public class ReplicationData
+public partial class ReplicationData : GodotObject
 {
 	// -----------------------------------------------------------------------------------------------------------------
 	// STATICS AND CONSTRUCTORS
@@ -48,7 +48,8 @@ public class ReplicationData
 	// -----------------------------------------------------------------------------------------------------------------
 
 	/// <summary>
-	/// The unique cross-network identifier of the MultiplayerReplicator that should handle this replication data.
+	/// The cross-network unique identifier of the <see cref="MultiplayerReplicator"/> that this replication data belong
+	/// to.
 	/// </summary>
 	public readonly Guid ReplicatorId;
 

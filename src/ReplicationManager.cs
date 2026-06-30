@@ -57,27 +57,68 @@ public partial class ReplicationManager : Node
 	/// called every frame, and creating a new callable every frame would be inefficient. Instead, we create it once and
 	/// reuse it.
 	/// </summary>
-	private Callable UpdateReplicationCallable => field.Target == null
-		? (field = Callable.From(this.UpdateReplication))
+	// TODO Benchmark this to see if it's actually more efficient than simply calling this.CallDeferred(MethodName.LateProcess).
+	private Callable LateProcessCallable => field.Target == null
+		? (field = Callable.From(this.LateProcess))
 		: field;
+
+	/// <summary>
+	/// The interval in milliseconds at which replication data is sent to peers. This is used to control the frequency
+	/// of replication updates.
+	/// </summary>
+	public double TickIntervalSec
+	{
+		get => field;
+		set => field = Mathf.Max(value, Mathf.Epsilon);
+	} = 1d/60;
+
+	/// <summary>
+	/// The accumulated time since the last replication tick. This is used to determine when to send the next
+	/// replication update to peers.
+	/// </summary>
+	private double TickAccumulatorSec
+	{
+		get => field;
+		set => field = Math.Clamp(value, 0f, this.TickIntervalSec * 2f);
+	} = 0f;
 
     // -----------------------------------------------------------------------------------------------------------------
     // PROPERTIES
     // -----------------------------------------------------------------------------------------------------------------
 
+	public int TickRate
+	{
+		get => Mathf.RoundToInt(1d / this.TickIntervalSec);
+		set => this.TickIntervalSec = 1d / value;
+	}
+
 	private ENetMultiplayerPeer? ENetPeer => this.Multiplayer.MultiplayerPeer as ENetMultiplayerPeer;
 	private MultiplayerPeer.ConnectionStatus ConnectionStatus => this.Multiplayer.MultiplayerPeer.GetConnectionStatus();
 
-    // -----------------------------------------------------------------------------------------------------------------
-    // SIGNALS
-    // -----------------------------------------------------------------------------------------------------------------
+	// -----------------------------------------------------------------------------------------------------------------
+	// SIGNALS
+	// -----------------------------------------------------------------------------------------------------------------
 
-    [Signal] public delegate void PeerConnectedEventHandler(long peerId);
+	[Signal] public delegate void PeerConnectedEventHandler(long peerId);
 	[Signal] public delegate void PeerDisconnectedEventHandler(long peerId);
 	[Signal] public delegate void ConnectedToServerEventHandler();
 	[Signal] public delegate void DisconnectedFromServerEventHandler();
 	[Signal] public delegate void ServerStartedEventHandler();
 	[Signal] public delegate void ServerStoppedEventHandler();
+
+	/// <summary>
+	/// This signal is emitted up to a number of times per second equal to <see cref="TickIntervalSec"/>, but not more
+	/// than the idle processing frame rate. It is intended to be used by <see cref="MultiplayerReplicator"/> (and
+	/// potentially future other nodes whose processing should be synchronized with the network) to observe properties
+	/// and send replication data.
+	///
+	/// Note that this signal does *not* provide a delta time. Time-based processing should occur in idle or physics
+	/// processing. This processing should only be used to send network data.
+	///
+	/// This signal is emitted in the end of the idle processing phase, after all nodes have been processed for the
+	/// current frame. This is to ensure that all nodes have been updated before sending replication data.
+	/// </summary>
+	[Signal] public delegate void NetworkProcessEventHandler();
 
     // -----------------------------------------------------------------------------------------------------------------
     // INTERNAL TYPES
@@ -115,7 +156,7 @@ public partial class ReplicationManager : Node
 	public override void _Process(double delta)
 	{
 		base._Process(delta);
-		this.UpdateReplicationCallable.CallDeferred();
+		this.LateProcessCallable.CallDeferred();
 	}
 
 	// public override void _PhysicsProcess(double delta)
@@ -125,6 +166,22 @@ public partial class ReplicationManager : Node
 
 	// public override string[] _GetConfigurationWarnings()
 	// 	=> base._PhysicsProcess(delta);
+
+	/// <summary>
+	/// We handle network processing in a deferred manner to ensure that all nodes have been processed for the current
+	/// frame before we send out replication data. This helps mitigating latency delays that would otherwise occur if we
+	/// sent replication data in the beginning of idle frame processing.
+	/// </summary>
+	private void LateProcess()
+	{
+		this.TickAccumulatorSec += this.GetProcessDeltaTime();
+		if (this.TickAccumulatorSec > this.TickIntervalSec)
+		{
+			this.TickAccumulatorSec -= this.TickIntervalSec;
+			this.EmitSignal(SignalName.NetworkProcess);
+			this.UpdateReplication();
+		}
+	}
 
 	// -----------------------------------------------------------------------------------------------------------------
 	// CONNECTIVITY METHODS
@@ -303,7 +360,7 @@ public partial class ReplicationManager : Node
 
 		// Update replication data for all replicators and enqueue it for all peers.
 		foreach(MultiplayerReplicator replicator in this.Replicators.Values)
-			if (replicator.BuildNextReplicationData(out ReplicationData? data))
+			if (replicator.BuildReplicationData(out ReplicationData? data))
 				foreach (ConnectedPeer peer in this.ConnectedPeers.Values)
 					peer.EnqueueReplicationData(data);
 
