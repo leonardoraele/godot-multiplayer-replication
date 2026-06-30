@@ -303,7 +303,7 @@ public partial class ReplicationManager : Node
 
 		// Update replication data for all replicators and enqueue it for all peers.
 		foreach(MultiplayerReplicator replicator in this.Replicators.Values)
-			if (replicator.TryGetNextReplicationData(out ReplicationData? data))
+			if (replicator.BuildNextReplicationData(out ReplicationData? data))
 				foreach (ConnectedPeer peer in this.ConnectedPeers.Values)
 					peer.EnqueueReplicationData(data);
 
@@ -357,7 +357,7 @@ public partial class ReplicationManager : Node
 
 	public void RegisterReplicator(MultiplayerReplicator replicator)
 	{
-		this.Replicators[replicator.UniqueId] = replicator;
+		this.Replicators[replicator.NetworkId] = replicator;
 		if (replicator.ReplicateChildSpawns && replicator.IsMultiplayerAuthority())
 			this.Rpc(MethodName.RpcSpawn, replicator.Root!.SceneFilePath, replicator.Root!.GetPath());
 	}
@@ -370,9 +370,9 @@ public partial class ReplicationManager : Node
 
 	public void UnregisterReplicator(MultiplayerReplicator replicator)
 	{
-		this.Replicators.Remove(replicator.UniqueId);
-		if (replicator.ReplicateDespawns)
-			this.ConnectedPeers.Values.ForEach(peer => peer.EnqueueDespawn(replicator.UniqueId));
+		this.Replicators.Remove(replicator.NetworkId);
+		if (replicator.DisableAutomaticDespawn)
+			this.ConnectedPeers.Values.ForEach(peer => peer.EnqueueDespawn(replicator.NetworkId));
 	}
 
 	public TimeSpan GetReplicationInterpolationTime(Node node)

@@ -6,16 +6,34 @@ using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using Godot;
 using Raele.GodotUtils.Extensions;
-using static Godot.SceneReplicationConfig;
 
 namespace Raele.MultiplayerReplication;
 
 /// <summary>
-/// The MultiplayerReplicator tracks the replicated fields of a target node. When the fields change on the multiplayer
-/// authority peer, they are automatically replicated to the interested peers.
+/// This node allows you to define a list of node properties to be replicated to other peers. You can define how data
+/// should be replicated (unreliably every frame, reliably on change, or manually) and whether received values are
+/// directly assigned to the properties or smoothly interpolated over time.
 ///
-/// The MultiplayerReplicator also makes sure the target node is correctly spawned and despawned on all peers when it
-/// enters or leaves the scene tree.
+/// You can also define spawn parents. These are special parent nodes are intended to host dynamically instantiated
+/// child nodes. This node will observe these parents and, whenever a child node is added to them, it will automatically
+/// be replicated to the other peers. Likewise, when a child node is removed from one of these spawn parents, it will be
+/// automatically despawned on the other peers. This is useful for synchronizing dynamically spawned objects, such as
+/// bullets, enemies, or other objects that are not part of the initial scene tree.
+///
+/// Note that, because this node only replicate explicitly defined properties, it won't replicate properties of
+/// dynamically spawned nodes -- those nodes must have their own <see cref="MultiplayerReplicator"/> nodes to replicate
+/// their properties.
+///
+/// For example, if you have an Enemy scene that has a <see cref="MultiplayerReplicator"/> node, it can replicate
+/// properties such as position and health to the other peers. It can also replicate spawning Projectile scenes that it
+/// instantiates. However, it cannot replicate the properties of the Projectile scene, because it doesn't know which
+/// properties to replicate. The Projectile scene must have its own <see cref="MultiplayerReplicator"/> node to
+/// replicate its properties, such as position and velocity, to the other peers.
+///
+/// // TODO:
+/// - Allow to programmatically configure which peers each property should be replicated to.
+/// - Allow client-side prediction of replicated properties, with automatic reconciliation when the server sends the
+/// 	authoritative value.
 /// </summary>
 [Tool][GlobalClass]
 public partial class MultiplayerReplicator : Node
@@ -30,28 +48,10 @@ public partial class MultiplayerReplicator : Node
 	// EXPORTS
 	// -----------------------------------------------------------------------------------------------------------------
 
-	/// <summary>
-	/// Determines the node that owns the properties to be replicated.
-	/// </summary>
-	[Export] public Node? Root
-	{
-		get => field ?? this.Owner;
-		set {
-			this.MigrateReplicatedFieldPaths(field, value);
-			field = value;
-			this.UpdateConfigurationWarnings();
-			this.NotifyPropertyListChanged();
-		}
-	}
-
 	[ExportGroup("Property Replication")]
 	/// <summary>
-	/// A list of field names to replicate, separated by comma. This MultiplayerReplicator will replicate these fields
-	/// in addition to the fields marked with the [Replicated] attribute.
-	///
-	/// Each entry of this list can be a direct property of the replicated node (i.e. the target node) or a
-	/// property path to a nested field, using NodePath notation. For example, ":position:x" will replicate only the X
-	/// component of the replicated node's `position` property.
+	/// The list of field to replicate. Each entry is a node path with property path. The node path is relative to the
+	/// scene root. (i.e. the owner of this node)
 	/// </summary>
 	[Export] public Godot.Collections.Array<string> ReplicatedFields = [];
 
@@ -65,24 +65,41 @@ public partial class MultiplayerReplicator : Node
 	/// objects, but it can introduce a small delay.
 	/// </summary>
 	[Export] public bool InterpolateValues = true;
-	[Export] public ReplicationMode ReplicationStrategy = ReplicationMode.OnChange; // TODO This is not implemented yet. For now, all replication is done on change.
 
-	[ExportGroup("Replicate Child Spawns")]
 	/// <summary>
-	/// If this is true, when the parent node enters the scene tree, this MultiplayerReplicator will automatically
-	/// notify the interested peers so that they also instantiate the same scene in the same path.
-	/// the target node.
+	/// Defines how the replication data is sent to the peers. The default is to send the data reliably only when it
+	/// changes. This is the recommended method for most properties, as it reduces bandwidth usage and ensures that the
+	/// data is always consistent across peers.
+	///
+	/// If you need different replication strategies for different properties, add separate
+	/// <see cref="MultiplayerReplicator"/> nodes, each with its own replication strategy.
 	/// </summary>
-	[Export(PropertyHint.GroupEnable)] public bool ReplicateChildSpawns = false;
+	[Export] public ReplicationStrategyEnum ReplicationStrategy = ReplicationStrategyEnum.ReliablyOnChange;
 
+	[ExportGroup("Spawning & Despawning Replication")]
+	/// <summary>
+	/// Whenever a child node is added to one of the nodes in this list, it will be automatically replicated to the
+	/// other peers -- meaning they will also instantiate the same scene and add it to this parent node. This is useful
+	/// for synchronizing dynamically spawned objects, such as bullets, enemies, or other objects that are not part of
+	/// the initial scene tree.
+	///
+	/// Likewise, whenever a child node is removed from one of these spawn parents, it will be automatically despawned
+	/// on the other peers.
+	/// </summary>
+	[Export] public Godot.Collections.Array<Node> SpawnParents = [];
+
+	[ExportSubgroup("Additional Options")]
+	/// <summary>
+	/// If this list is not empty, only these explicitly listed scenes will be replicated to the other peers.
+	/// </summary>
 	[Export] public string[] SceneSpawnWhitelist = [];
 
 	/// <summary>
-	/// Similarly to <see cref="ReplicateChildSpawns"/>, if this is true, when the parent node exits the scene tree, this
-	/// MultiplayerReplicator will automatically notify the interested peers so that they also remove their version of
-	/// the target node.
+	/// If this is enabled, this node will not despawn the replicated nodes when they are removed from their spawn
+	/// parents. This is useful to reduce bandwidth usage in cases where the clients can determine when to destroy the
+	/// spawned nodes by themselves.
 	/// </summary>
-	[Export] public bool ReplicateDespawns = true;
+	[Export] public bool DisableAutomaticDespawn = false;
 
 	// -----------------------------------------------------------------------------------------------------------------
 	// FIELDS
@@ -98,10 +115,10 @@ public partial class MultiplayerReplicator : Node
 	/// it is hidden in the editor and automatically generated when the MultiplayerReplicator is created. It should not
 	/// be modified by the user.
 	/// </remarks>
-	[Export] private string SerializedReplicatorId
+	[Export] private string SerializedNetworkId
 	{
-		get => this.UniqueId.ToString();
-		set => this.UniqueId = Guid.TryParse(value, out Guid guid) ? guid : Guid.Empty;
+		get => this.NetworkId.ToString();
+		set => this.NetworkId = Guid.TryParse(value, out Guid guid) ? guid : Guid.Empty;
 	}
 
 	/// <summary>
@@ -123,9 +140,41 @@ public partial class MultiplayerReplicator : Node
 	// -----------------------------------------------------------------------------------------------------------------
 
 	/// <summary>
-	/// The unique identifier for this MultiplayerReplicator across hosts.
+	/// Unique identifier for this MultiplayerReplicator across its local owned scene.
+	///
+	/// // TODO This could be a single-byte digit if we use tool scripts to automatically assign unique ids whenever a
+	/// node is added/removed from the scene.
 	/// </summary>
-	public Guid UniqueId = Guid.NewGuid();
+	private byte SceneId => this.GetTree()
+		.GetNodesInGroup(GROUP_NAME)
+		.OfType<MultiplayerReplicator>()
+		.Where(replicator => replicator.Owner == this.Owner)
+		.ToList()
+		.SortInplace((r1, r2) => string.Compare(r1.Name, r2.Name, StringComparison.Ordinal))
+		.Select((replicator, index) => (replicator, (byte) index))
+		.First(tuple => tuple.replicator == this)
+		.Item2;
+
+	/// <summary>
+	/// Unique identifier for this MultiplayerReplicator across the project. This has the same value
+	/// </summary>
+	private byte[] StaticId
+	{
+		get
+		{
+			long uid = ResourceUid.TextToId($"{ResourceUid.PathToUid(this.Owner.SceneFilePath)}/{this.Name}");
+			byte[] bytes = BitConverter.GetBytes(uid);
+			byte[] result = new byte[9];
+			Array.Copy(bytes, 0, result, 0, Math.Min(bytes.Length, 8));
+			result[8] = SceneId;
+			return result;
+		}
+	}
+
+	/// <summary>
+	/// The unique identifier for this MultiplayerReplicator across the network.
+	/// </summary>
+	public Guid NetworkId;
 
 	// -----------------------------------------------------------------------------------------------------------------
 	// SIGNALS
@@ -137,6 +186,37 @@ public partial class MultiplayerReplicator : Node
 	// INTERNAL TYPES
 	// -----------------------------------------------------------------------------------------------------------------
 
+	public enum ReplicationStrategyEnum
+	{
+		/// <summary>
+		/// Replication data is sent to the peers every frame, regardless of whether the values have changed or not.
+		///
+		/// This is the recommended method for properties that change very frequently -- more than once for every two
+		/// frames. For example, the position, rotation, and velocity of a car in a racing game. In these cases, this
+		/// method is more efficient because it avoids the overhead of reliable communication and allows for more
+		/// efficient use of bandwidth.
+		/// </summary>
+		UnreliablyEveryFrame,
+
+		/// <summary>
+		/// Replication data is reliably sent to the peers only when the values have changed since the last time they
+		/// were sent.
+		///
+		/// This method is recommended for properties that change only occasionally. For example, the health of a player
+		/// in a first-person shooter game. In these cases, this method is more efficient because it avoids sending
+		/// unnecessary data when the values have not changed.
+		/// </summary>
+		ReliablyOnChange,
+
+		/// <summary>
+		/// Replication data is sent to the peers only when the the <see cref="Refresh"/> method is called by the user.
+		///
+		/// This is useful for properties that are usually not relevant to the other peers, but that can be replicated
+		/// on demand. For example, a player can request to see the inventory of another player, and the inventory can
+		/// be replicated only when the request is made.
+		/// </summary>
+		ManuallyOnDemand,
+	}
 
 	// -----------------------------------------------------------------------------------------------------------------
 	// EVENTS
@@ -146,19 +226,13 @@ public partial class MultiplayerReplicator : Node
 	{
 		base._ValidateProperty(property);
 		switch (property["name"].AsString()) {
-			case nameof(this.SerializedReplicatorId):
+			case nameof(this.SerializedNetworkId):
 				property["usage"] = (long) PropertyUsageFlags.Storage;
 				break;
-			case nameof(this.ReplicatedFields):
-				string propNames = (this.Root == this ? [] : this.Root?.GetPropertyList())
-					?.Where(prop => (prop["usage"].AsInt64() & (long) PropertyUsageFlags.Storage) != 0)
-					.Select(prop => prop["name"].AsString())
-					.ToArray()
-					.Join(",")
-					?? "";
+			case nameof(this.SceneSpawnWhitelist):
 				property["type"] = (long) Variant.Type.Array;
 				property["hint"] = (long) PropertyHint.ArrayType;
-				property["hint_string"] = $"{Variant.Type.String:D}/{PropertyHint.EnumSuggestion:D}:{propNames}";
+				property["hint_string"] = $"{Variant.Type.String:D}/{PropertyHint.File:D}:*.tscn,*.scn";
 				break;
 		}
 	}
@@ -166,16 +240,16 @@ public partial class MultiplayerReplicator : Node
 	public override string[] _GetConfigurationWarnings()
 		=> (base._GetConfigurationWarnings() ?? [])
 			.AppendIf(this.Root == null, $"The mandatory field '{nameof(this.Root)}' is not set.")
+			// TODO Detect if there are any invalid entries in the replicated fields list
+			.AppendIf(!this.UniqueNameInOwner, $"The {nameof(MultiplayerReplicator)} node must have a unique name. This is necessary to facilitate identifying it across the network. Please right-click this node and enable \"Access as Unique Name\" for this node.")
 			.ToArray();
 
 	public override void _EnterTree()
 	{
 		base._EnterTree();
-		this.AddToGroup(GROUP_NAME);
+		this.AddToGroup(GROUP_NAME, persistent: true);
 		if (Engine.IsEditorHint())
 			return;
-		if (this.ReplicateChildSpawns)
-			this.UniqueId = Guid.NewGuid();
 		ReplicationManager.Instance.RegisterReplicator(this);
 	}
 
@@ -209,6 +283,7 @@ public partial class MultiplayerReplicator : Node
 	// METHODS
 	// -----------------------------------------------------------------------------------------------------------------
 
+	[Obsolete]
 	private IEnumerable<string> GetFieldNames(uint bitmask) => this.ReplicatedFields
 		.Where((_, index) => (bitmask & (1u << index)) != 0);
 
@@ -225,7 +300,7 @@ public partial class MultiplayerReplicator : Node
 	/// </summary>
 	/// <param name="data">The replication data to be sent to the peers.</param>
 	/// <returns>True if there is replication data to be sent, false otherwise.</returns>
-	public bool TryGetNextReplicationData([NotNullWhen(true)] out ReplicationData? data)
+	public bool BuildNextReplicationData([NotNullWhen(true)] out ReplicationData? data)
 	{
 		data = null;
 		if (!this.IsMultiplayerAuthority())
@@ -233,7 +308,7 @@ public partial class MultiplayerReplicator : Node
 		uint dirtyFields = this.GetNextDirtyFields();
 		if (dirtyFields == 0u)
 			return false;
-		data = new(this.UniqueId, dirtyFields, [..this.ReplicatedFieldsCache]);
+		data = new(this.NetworkId, dirtyFields, [..this.ReplicatedFieldsCache]);
 		// GD.PrintS(nameof(MultiplayerReplicator), this.Multiplayer.GetUniqueId(), $"Generated replication data for \"{this.Target.Name}\" ({string.Join(", ", this.GetFieldNames(data.FieldMask))})");
 		return data != null;
 	}
@@ -359,5 +434,6 @@ public partial class MultiplayerReplicator : Node
 				return $"{newTarget.GetPathTo(subject)}::{fieldName}";
 			})
 			.ToGodotArrayT();
+		this.NotifyPropertyListChanged();
 	}
 }

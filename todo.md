@@ -61,3 +61,9 @@ Issues:
 - The packet should also contain the RID (or another reference) to the scene containing the `MultiplayerReplicator` and
 	the path where the scene is being added.
 - Upon receiving the packet, each peer instantiates the same scene and add it to the same path.
+
+### // TODO
+
+- Packets should be numbeted and Ack packets must contain the id of the packet to which they are acking so that we don't
+	accidentally ack to wrong packets when they arrive out of order; also so that we don't accept old replication data
+	that arrives later
