@@ -4,7 +4,6 @@ using System.Data;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
-using System.Numerics;
 using Godot;
 using Raele.GodotUtils.Extensions;
 
@@ -88,7 +87,11 @@ public partial class MultiplayerReplicator : Node
 	/// Likewise, whenever a child node is removed from one of these spawn parents, it will be automatically despawned
 	/// on the other peers.
 	/// </summary>
-	[Export] public Godot.Collections.Array<Node> SpawnParents = [];
+	[Export] public Node?[] SpawnParents
+	{
+		get;
+		set { field = value; this.UpdateConfigurationWarnings(); }
+	} = [];
 
 	[ExportSubgroup("Additional Options")]
 	/// <summary>
@@ -111,87 +114,53 @@ public partial class MultiplayerReplicator : Node
 	/// Stores the values of the replicated fields in the same order as the fields are registered in the
 	/// <see cref="ReplicatedFields"/> array. Updated every frame.
 	/// </summary>
-	private Variant[] ReplicatedFieldOldValues
+	private ReplicatedFieldHelper[] ReplicatedFieldHelpers
 	{
 		get
 		{
 			if (field == null || this.ReplicatedFields.Count != field.Length)
-				field = new Variant[this.ReplicatedFields.Count];
+			{
+				field = new ReplicatedFieldHelper[this.ReplicatedFields.Count];
+				for (int i = 0; i < this.ReplicatedFields.Count; i++)
+				{
+					if (!this.GetFieldDataAt(i, out Node? subject, out string? fieldName))
+						continue;
+					field[i] = new ReplicatedFieldHelper { Target = subject, FieldName = fieldName };
+				}
+			}
 			return field;
 		}
 	}
 
-	private Variant[] ReplicatedFieldNewValues
-	{
-		get
-		{
-			if (field == null || this.ReplicatedFields.Count != field.Length)
-				field = new Variant[this.ReplicatedFields.Count];
-			return field;
-		}
-	}
-
-	private Func<Variant>[] ReplicatedFieldGetters
-	{
-		get
-		{
-			if (field == null || this.ReplicatedFields.Count != field.Length)
-				field = this.ReplicatedFields.Select<string, Func<Variant>>(fieldPath =>
-						this.GetFieldData(fieldPath, out Node? subject, out string? fieldName, out _)
-							? () => subject.GetIndexed(fieldName)
-							: () => new Variant()
-					)
-					.ToArray();
-			return field;
-		}
-	}
+	/// <summary>
+	/// Unique identifier for this <see cref="MultiplayerReplicator"/> across the network.
+	/// </summary>
+	public Guid NetworkId { get; private set; } = Guid.NewGuid();
 
 	// -----------------------------------------------------------------------------------------------------------------
 	// PROPERTIES
 	// -----------------------------------------------------------------------------------------------------------------
 
 	/// <summary>
-	/// Unique identifier for this MultiplayerReplicator across its local owned scene.
-	///
-	/// // TODO This could be a single-byte digit if we use tool scripts to automatically assign unique ids whenever a
-	/// node is added/removed from the scene.
+	/// This node's <see cref="NetworkId"/> as a string. This is useful as it can be serialized by godot and stored in
+	/// the scene. This export field is storage-only and hidden in the editor.
 	/// </summary>
-	private byte SceneId => this.GetTree()
-		.GetNodesInGroup(GROUP_REPLICATORS)
-		.OfType<MultiplayerReplicator>()
-		.Where(replicator => replicator.Owner == this.Owner)
-		.ToList()
-		.SortInplace((r1, r2) => string.Compare(r1.Name, r2.Name, StringComparison.Ordinal))
-		.Select((replicator, index) => (replicator, (byte) index))
-		.First(tuple => tuple.replicator == this)
-		.Item2;
-
-	/// <summary>
-	/// Unique identifier for this MultiplayerReplicator across the project. This has the same value
-	/// </summary>
-	private byte[] StaticId
+	[Export] public string SerializedNetworkId
 	{
-		get
+		get => this.NetworkId.ToString();
+		set
 		{
-			long uid = ResourceUid.TextToId($"{ResourceUid.PathToUid(this.Owner.SceneFilePath)}/{this.Name}");
-			byte[] bytes = BitConverter.GetBytes(uid);
-			byte[] result = new byte[9];
-			Array.Copy(bytes, 0, result, 0, Math.Min(bytes.Length, 8));
-			result[8] = SceneId;
-			return result;
+			Debug.Assert(Guid.TryParse(value, out Guid parsed), $"Failed to parse {nameof(this.SerializedNetworkId)}. Cause: Invalid GUID string. Value: \"{value}\"");
+			this.NetworkId = parsed;
 		}
 	}
-
-	/// <summary>
-	/// The unique identifier for this MultiplayerReplicator across the network.
-	/// </summary>
-	public Guid NetworkId;
 
 	// -----------------------------------------------------------------------------------------------------------------
 	// SIGNALS
 	// -----------------------------------------------------------------------------------------------------------------
 
 	[Signal] public delegate void ReplicationDataEventHandler(ReplicationData data);
+	[Signal] public delegate void SpawnChildEventHandler(SpawnData data);
 
 	// -----------------------------------------------------------------------------------------------------------------
 	// INTERNAL TYPES
@@ -230,6 +199,28 @@ public partial class MultiplayerReplicator : Node
 		ReliablyOnDemand,
 	}
 
+	/// <summary>
+	/// Helper struct to store the old and new values of a replicated field, along with the target node and field name.
+	/// This is used to detect when a field has changed its value and needs to be replicated to the other peers.
+	/// </summary>
+	private struct ReplicatedFieldHelper
+	{
+		public required Node Target { get; init; }
+		public required string FieldName { get; init; }
+		public Variant OldValue { get; private set; }
+		public Tween? InterpolationTween { get; set; }
+
+		public Variant CurrentValue
+		{
+			get => this.Target.GetIndexed(this.FieldName);
+			set => this.Target.SetIndexed(this.FieldName, value);
+		}
+		public bool IsDirty => !this.CurrentValue.Equals(this.OldValue);
+
+		public void Cache()
+			=> this.OldValue = this.CurrentValue;
+	}
+
 	// -----------------------------------------------------------------------------------------------------------------
 	// EVENTS
 	// -----------------------------------------------------------------------------------------------------------------
@@ -243,16 +234,17 @@ public partial class MultiplayerReplicator : Node
 				property["hint"] = (long) PropertyHint.ArrayType;
 				property["hint_string"] = $"{Variant.Type.String:D}/{PropertyHint.File:D}:*.tscn,*.scn";
 				break;
+			case nameof(this.SerializedNetworkId):
+				property["usage"] = (long) PropertyUsageFlags.Storage;
+				break;
 		}
 	}
 
 	public override string[] _GetConfigurationWarnings()
 	{
 		List<string> warnings = [.. base._GetConfigurationWarnings() ?? []];
-		if (!this.UniqueNameInOwner)
-			warnings.Add($"The {nameof(MultiplayerReplicator)} node must have a unique name. This is necessary to facilitate identifying it across the network. Please right-click this node and enable \"Access as Unique Name\" for this node.");
 		foreach (string field in this.ReplicatedFields)
-			if (!this.GetFieldData(field, out Node? subject, out string? fieldName, out Variant value))
+			if (!this.GetFieldData(field, out _, out _))
 				warnings.Add($"The field \"{field}\" is invalid. See console log for details.");
 		return warnings.ToArray();
 	}
@@ -298,132 +290,100 @@ public partial class MultiplayerReplicator : Node
 	// public override string[] _GetConfigurationWarnings()
 	// 	=> base._PhysicsProcess(delta);
 
+	// -----------------------------------------------------------------------------------------------------------------
+	// METHODS
+	// -----------------------------------------------------------------------------------------------------------------
+
+	/// <summary>
+	/// This method is called by the <see cref="ReplicationManager"/> every frame, but it only sends replication data to
+	/// the peers if the replication strategy is not set to <see cref="ReplicationStrategyEnum.ReliablyOnDemand"/>.
+	/// </summary>
 	private void ProcessNetwork()
 	{
 		if (this.ReplicationStrategy != ReplicationStrategyEnum.ReliablyOnDemand)
 			this.ForceReplicate();
 	}
 
-	// -----------------------------------------------------------------------------------------------------------------
-	// METHODS
-	// -----------------------------------------------------------------------------------------------------------------
-
-	private void ForceReplicate()
+	/// <summary>
+	/// Forces immediate replication of the current values of replicated fields to the other peers, regardless of
+	/// whether they have changed or not.
+	///
+	/// This method is particularly useful when <see cref="ReplicationStrategy"/> is set to
+	/// <see cref="ReplicationStrategyEnum.ReliablyOnDemand"/>. If this is the case, this method must be called manually
+	/// by the user whenever they want to replicate the current values of the observed fields to the other peers.
+	///
+	/// No data is sent if the local host is not the multiplayer authority for this node. The multiplayer authority peer
+	/// is the only peer that should send replication data to the others.
+	/// </summary>
+	public void ForceReplicate()
 	{
-		this.UpdateReplicatedFieldsCache();
-		ReplicationData? data = this.BuildReplicationData();
+		if (!this.IsMultiplayerAuthority())
+			return;
+		ReplicationData? data = this.ReplicationStrategy == ReplicationStrategyEnum.ReliablyOnChange
+			? this.BuildReplicationDataWithDirtyFields()
+			: this.BuildReplicationDataWithAllFields();
 		if (data != null)
 			this.EmitSignal(SignalName.ReplicationData, data);
-	}
-
-	[Obsolete]
-	private IEnumerable<string> GetFieldNames(uint bitmask) => this.ReplicatedFields
-		.Where((_, index) => (bitmask & (1u << index)) != 0);
-
-	/// <summary>
-	/// Updates the cached values of the replicated fields. This is necessary to detect when a field has changed its
-	/// value.
-	/// </summary>
-	private void UpdateReplicatedFieldsCache()
-	{
-		for (int i = 0; i < this.ReplicatedFields.Count; i++)
-		{
-			this.ReplicatedFieldOldValues[i] = this.ReplicatedFieldNewValues[i];
-			this.ReplicatedFieldNewValues[i] = this.ReplicatedFieldGetters[i]();
-		}
+		this.ReplicatedFieldHelpers.ForEach(helper => helper.Cache());
 	}
 
 	/// <summary>
-	/// Gets the next replication data to be sent to the peers, if available. The replication data contains the values
-	/// of the replicated fields that should be sent to the other peers according to the selected
-	/// <see cref="ReplicationStrategy"/>.
-	///
-	/// <list type="bullet">
-	/// <item>For UnreliablyEveryFrame, the replications data always contains the most recent value for all replicated fields.</item>
-	/// <item>For ReliablyOnChange and ReliablyOnDemand, this method returns the most recent value for the fields that changed since the last time this method was called.</item>
-	/// </list>
-	///
-	/// This method returns null if there is no replication data to be sent, either because there are no dirty fields or
-	/// because this peer is not the multiplayer authority for this node. (the multiplayer authority peer is the only
-	/// peer that should send replication data to the others)
+	/// Builds a <see cref="ReplicationData"/> packet with the most recent data for all replicated fields. This method
+	/// returns null if there are no replicated fields. (i.e. if <see cref="ReplicatedFields"/> is empty)
 	/// </summary>
-	private ReplicationData? BuildReplicationData()
-		=> !this.IsMultiplayerAuthority()
-			? null
-			: this.ReplicationStrategy switch {
-				ReplicationStrategyEnum.UnreliablyEveryFrame => this.BuildReplicationDataWithAllFields(),
-				ReplicationStrategyEnum.ReliablyOnChange
-					or ReplicationStrategyEnum.ReliablyOnDemand => this.BuildReplicationDataWithChangedFields(),
-				_ => null,
-			};
-
 	private ReplicationData? BuildReplicationDataWithAllFields()
-		=> new(this.NetworkId, uint.MaxValue, this.ReplicatedFieldNewValues);
-
-	private ReplicationData? BuildReplicationDataWithChangedFields()
 	{
-		List<int> dirtyIndexes = Enumerable.Range(0, this.ReplicatedFields.Count)
-			.Where(this.TestFieldIsDirty)
-			.ToList();
-		if (dirtyIndexes.Count == 0)
+		uint dirtyFields = 0u.BitFill(0, this.ReplicatedFieldHelpers.Length);
+		if (!dirtyFields.HasAnyBitSet())
 			return null;
-		uint dirtyFields = dirtyIndexes.Aggregate(0u, (acc, index) => acc.SetBit(index));
-		Variant[] newValues = dirtyIndexes.Select(index => this.ReplicatedFieldNewValues[index]).ToArray();
+		Variant[] values = this.ReplicatedFieldHelpers.Select(helper => helper.CurrentValue).ToArray();
+		return new(this.NetworkId, dirtyFields, values);
+	}
+
+	/// <summary>
+	/// Gets a <see cref="ReplicationData"/> packet with the most recent value for the fields that have changed since
+	/// the last replication. This method returns null if there are no dirty fields.
+	/// </summary>
+	private ReplicationData? BuildReplicationDataWithDirtyFields()
+	{
+		uint dirtyFields = this.ReplicatedFieldHelpers.Select((helper, index) => (helper, index))
+			.Where(tuple => tuple.helper.IsDirty)
+			.Aggregate(0u, (acc, tuple) => acc.SetBit(tuple.index));
+		if (!dirtyFields.HasAnyBitSet())
+			return null;
+		Variant[] newValues = this.ReplicatedFieldHelpers
+			.Where(helper => helper.IsDirty)
+			.Select(helper => helper.CurrentValue)
+			.ToArray();
 		return new(this.NetworkId, dirtyFields, newValues);
 	}
 
 	/// <summary>
-	/// Updates the dirtiness of all fields; i.e. marks them as dirty if their values have changed since the last time
-	/// this method was called.
-	/// </summary>
-	private uint GetDirtyFields()
-	{
-		// No need to update dirtiness if we are not the multiplayer authority, because only the multiplayer authority
-		// should send replication data to the other peers. The other peers will receive the replication data from the
-		// multiplayer authority and update their local values accordingly.
-		if (!this.IsMultiplayerAuthority())
-			return 0u;
-		return Enumerable.Range(0, this.ReplicatedFields.Count)
-			.Where(this.TestFieldIsDirty)
-			.Select(index => 1u << index)
-			.Aggregate(0u, (acc, value) => acc | value);
-	}
-
-	/// <summary>
-	/// Updates the dirtiness of a field; i.e. marks it as dirty if its value has changed since the last time this
-	/// method was called. Returns true if the field was marked as dirty, false otherwise.
-	/// </summary>
-	/// <returns>True if the field is dirty.</returns>
-	private bool TestFieldIsDirty(int index)
-		=> !this.ReplicatedFieldNewValues[index].Equals(this.ReplicatedFieldOldValues[index]);
-
-	/// <summary>
-	/// Sets the values of the fields specified by the bitmask. This method is called by the
-	/// <see cref="ReplicationManager"/> when it receives replication data from the multiplayer authority peer.
+	/// This method is used by the <see cref="ReplicationManager"/> to deliver replication data received from the
+	/// multiplayer authority peer. It updates the corresponding fields on the local host.
 	/// </summary>
 	public void AcceptReplicationData(ReplicationData data)
+		=> this.ReplicatedFieldHelpers.Where((_, index) => data.FieldMask.HasBitSet(index))
+			.ForEach((helper, index) => this.AcceptNewFieldValue(helper, data.Values[index]));
+
+	private void AcceptNewFieldValue(ReplicatedFieldHelper helper, Variant newValue)
 	{
-		if (this.Root == null)
-			return;
-		GD.PrintS(nameof(MultiplayerReplicator), this.Multiplayer.GetUniqueId(), $"Received replication data for \"{this.Root.Name}\" ({string.Join(", ", this.GetFieldNames(data.FieldMask))})");
-		string[] fieldNames = this.GetFieldNames(data.FieldMask).ToArray();
-		Debug.Assert(fieldNames.Length == data.Values.Length, "Field names and values arrays must have the same length.");
-		for (int i = 0; i < data.Values.Length; i++)
-			this.AcceptNewFieldValue(fieldNames[i], data.Values[i]);
+		if (this.InterpolateValues)
+			this.AcceptNewFieldValueWithInterpolation(helper, newValue);
+		else
+			this.AcceptNewFieldValueWithoutInterpolation(helper, newValue);
 	}
 
-	private void AcceptNewFieldValue(string fieldName, Variant newValue)
+	private void AcceptNewFieldValueWithoutInterpolation(ReplicatedFieldHelper helper, Variant newValue)
+		=> helper.CurrentValue = newValue;
+
+	private void AcceptNewFieldValueWithInterpolation(ReplicatedFieldHelper helper, Variant newValue)
 	{
-		if (this.Root == null)
-			return;
-		if (!this.InterpolateValues)
-		{
-			this.Root.SetIndexed(fieldName, newValue);
-			return;
-		}
-		Tween tween = this.CreateTween();
 		double duration = ReplicationManager.Instance.GetReplicationInterpolationTime(this).TotalSeconds;
-		tween.TweenProperty(this.Root, fieldName, newValue, duration);
+		Callable setter = Callable.From((Variant intermediateValue) => helper.CurrentValue = intermediateValue);
+		helper.InterpolationTween?.Kill();
+		helper.InterpolationTween = this.CreateTween();
+		helper.InterpolationTween.TweenMethod(setter, helper.CurrentValue, newValue, duration);
 	}
 
 	// private void OnPeerChangedInterest(ConnectedPeer peer)
@@ -449,57 +409,34 @@ public partial class MultiplayerReplicator : Node
 
 	private void OnAddReplicationFieldButtonPressed()
 	{
-		if (this.Root == null)
-		{
-			GD.PrintErr(nameof(MultiplayerReplicator), $"Cannot add replication field because the mandatory field '{nameof(this.Root)}' is not set.");
-			return;
-		}
-
 		EditorInterface.Singleton.PopupNodeSelector(Callable.From((NodePath path) =>
 		{
 			Node subject = this.Owner.GetNode(path);
-			EditorInterface.Singleton.PopupPropertySelector(subject, Callable.From((string property) =>
+			EditorInterface.Singleton.PopupPropertySelector(subject, Callable.From((string propertyPath) =>
 			{
-				this.ReplicatedFields.Add($"{this.Root.GetPathTo(subject)}:{property}");
+				this.ReplicatedFields.Add(this.Owner.GetPathTo(subject) + propertyPath);
 				this.NotifyPropertyListChanged();
 			}));
 		}));
 	}
 
-	private void MigrateReplicatedFieldPaths(Node? oldTarget, Node? newTarget)
-	{
-		if (oldTarget == null || newTarget == null)
-			return;
-		this.ReplicatedFields = this.ReplicatedFields.Select(fieldPath =>
-			{
-				if (!this.GetFieldData(fieldPath, out Node? subject, out string? fieldName, out _))
-					return fieldPath;
-				return $"{newTarget.GetPathTo(subject)}::{fieldName}";
-			})
-			.ToGodotArrayT();
-		this.NotifyPropertyListChanged();
-	}
-
 	private bool GetFieldDataAt(
 		int index,
 		[NotNullWhen(true)] out Node? subject,
-		[NotNullWhen(true)] out string? fieldName,
-		out Variant value
+		[NotNullWhen(true)] out string? fieldName
 	)
-		=> this.GetFieldData(this.ReplicatedFields[index], out subject, out fieldName, out value);
+		=> this.GetFieldData(this.ReplicatedFields[index], out subject, out fieldName);
 	private bool GetFieldData(
 		string fieldPath,
 		[NotNullWhen(true)] out Node? subject,
-		[NotNullWhen(true)] out string? fieldName,
-		out Variant value
+		[NotNullWhen(true)] out string? fieldName
 	)
 	{
 		subject = null;
-		value = new Variant();
 		(string? nodePath, fieldName) = fieldPath.Split("::");
 		if (string.IsNullOrWhiteSpace(nodePath) || string.IsNullOrWhiteSpace(fieldName))
 		{
-			GD.PushWarning($"{nameof(MultiplayerReplicator)}: Failed to get value for field \"{fieldPath}\". Cause: it should be in the format \"NodePath::PropertyName\".");
+			GD.PushWarning($"{nameof(MultiplayerReplicator)}: Failed to get value for field \"{fieldPath}\". Cause: it should be in the format \"Path/To/Node:property_name\".");
 			return false;
 		}
 		subject = this.Owner.GetNode(nodePath);
@@ -508,7 +445,6 @@ public partial class MultiplayerReplicator : Node
 			GD.PushWarning($"{nameof(MultiplayerReplicator)}: Failed to get value for field \"{fieldPath}\". Cause: the node at path \"{nodePath}\" does not exist.");
 			return false;
 		}
-		value = subject.GetIndexed(fieldName);
 		return true;
 	}
 }

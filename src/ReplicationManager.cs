@@ -53,7 +53,7 @@ public partial class ReplicationManager : Node
 	private Dictionary<Guid, MultiplayerReplicator> Replicators = new();
 
 	/// <summary>
-	/// A preconstructed callable for the <see cref="UpdateReplication"/> method. This is useful because this method is
+	/// A preconstructed callable for the <see cref="SendQueuedPackets"/> method. This is useful because this method is
 	/// called every frame, and creating a new callable every frame would be inefficient. Instead, we create it once and
 	/// reuse it.
 	/// </summary>
@@ -178,8 +178,11 @@ public partial class ReplicationManager : Node
 		if (this.TickAccumulatorSec > this.TickIntervalSec)
 		{
 			this.TickAccumulatorSec -= this.TickIntervalSec;
-			this.EmitSignal(SignalName.NetworkProcess);
-			this.UpdateReplication();
+			try {
+				this.EmitSignal(SignalName.NetworkProcess);
+			} finally {
+				this.SendQueuedPackets();
+			}
 		}
 	}
 
@@ -345,35 +348,20 @@ public partial class ReplicationManager : Node
 	// -----------------------------------------------------------------------------------------------------------------
 
 	/// <summary>
-	/// Updates the replication data for all peers. This method is called every frame. It sends replication data to all
-	/// connected peers based on their interests and the current state of the replicators.
+	/// This method should be called every frame. It sends replication data that has been queued by the
+	/// <see cref="MultiplayerReplicator"/>, as well as acknowledgment data for replication data that has been received
+	/// from peers.
 	/// </summary>
-	private void UpdateReplication()
+	private void SendQueuedPackets()
 	{
 		if (this.ConnectionStatus != MultiplayerPeer.ConnectionStatus.Connected)
 			return;
-		if (Engine.GetMainLoop() is not SceneTree tree)
-		{
-			Debug.Assert(false, $"Failed to get {nameof(ReplicationManager)}.{nameof(this.UpdateReplication)} because the main loop is not a {nameof(SceneTree)}.");
-			return;
-		}
 
-		// Update replication data for all replicators and enqueue it for all peers.
-		foreach(MultiplayerReplicator replicator in this.Replicators.Values)
-			if (replicator.BuildReplicationData(out ReplicationData? data))
-				foreach (ConnectedPeer peer in this.ConnectedPeers.Values)
-					peer.EnqueueReplicationData(data);
-
-		// Send replication packets to all peers. The replication packet contains both replication data and
-		// acknowledgment data enqueued to be sent to that peer.
 		foreach (ConnectedPeer peer in this.ConnectedPeers.Values)
 		{
 			ReplicationPacket packet = peer.CreateNextReplicationPacket();
 			if (!packet.Empty)
-			{
 				this.RpcId(peer.PeerId, MethodName.RpcAcceptReplicationData, ReplicationPacket.Serialize(packet));
-				// GD.PrintS(nameof(ReplicationManager), this.Multiplayer.GetUniqueId(), $"📨 Replication packet sent.", new { Recipient = peer.PeerId, packet });
-			}
 		}
 	}
 
@@ -388,8 +376,6 @@ public partial class ReplicationManager : Node
 
 		ReplicationPacket packet = ReplicationPacket.Deserialize(serializedPacket);
 
-		// GD.PrintS(nameof(ReplicationManager), this.Multiplayer.GetUniqueId(), $"📩 Replication packet received.", new { Sender = peer.PeerId, packet });
-
 		// Clear replication data for the acknowledged fields, so that we stop sending the data in the next packets.
 		foreach (AckData ack in packet.AckData)
 			peer.AcceptAck(ack);
@@ -397,17 +383,29 @@ public partial class ReplicationManager : Node
 		// Deliver replication data to the appropriate replicators.
 		foreach (ReplicationData data in packet.ReplicationData)
 		{
+			// Enqueue the acknowledgment data for the received replication data, so that we can send it back to the
+			// sender in the next replication packet.
 			peer.EnqueueAck(new(data.ReplicatorId, data.FieldMask));
+
+			// Ignore packets for replicators that we can't find, but prints a warning.
 			if (!this.Replicators.TryGetValue(data.ReplicatorId, out MultiplayerReplicator? replicator))
-				continue;
-			long expectedSender = this.Multiplayer.IsServer()
-				? replicator.GetMultiplayerAuthority()
-				: this.GetMultiplayerAuthority();
-			if (this.Multiplayer.GetRemoteSenderId() != expectedSender)
 			{
-				Debug.Assert(false, $"Unexpected sender for replication data: {this.Multiplayer.GetRemoteSenderId()}, expected: {expectedSender}");
+				GD.PrintRich($"[color=yellow]{nameof(ReplicationManager)} {this.Multiplayer.GetUniqueId()}: Received replication data but could not find the recipient replicator. Replicator ID: \"{data.ReplicatorId}\"");
 				continue;
 			}
+
+			{
+				long expectedSender = this.Multiplayer.IsServer()
+					? replicator.GetMultiplayerAuthority()
+					: this.GetMultiplayerAuthority();
+				if (this.Multiplayer.GetRemoteSenderId() != expectedSender)
+				{
+					GD.PrintRich($"[color=yellow]{nameof(ReplicationManager)} {this.Multiplayer.GetUniqueId()}: Received replication data from an unexpected sender. Sender ID: {this.Multiplayer.GetRemoteSenderId()}, expected: {expectedSender}");
+					continue;
+				}
+			}
+
+			// Finally deliver the replication data to the replicator.
 			replicator.AcceptReplicationData(data);
 		}
 	}
@@ -415,21 +413,27 @@ public partial class ReplicationManager : Node
 	public void RegisterReplicator(MultiplayerReplicator replicator)
 	{
 		this.Replicators[replicator.NetworkId] = replicator;
-		if (replicator.ReplicateChildSpawns && replicator.IsMultiplayerAuthority())
-			this.Rpc(MethodName.RpcSpawn, replicator.Root!.SceneFilePath, replicator.Root!.GetPath());
-	}
-
-	[Rpc(MultiplayerApi.RpcMode.AnyPeer)]
-	public void RpcSpawn()
-	{
-
+		replicator.ReplicationData += this.EnqueueReplicationDataForAllPeers;
+		replicator.SpawnChild += this.EnqueueSpawnForAllPeers;
 	}
 
 	public void UnregisterReplicator(MultiplayerReplicator replicator)
 	{
 		this.Replicators.Remove(replicator.NetworkId);
-		if (replicator.DisableAutomaticDespawn)
-			this.ConnectedPeers.Values.ForEach(peer => peer.EnqueueDespawn(replicator.NetworkId));
+		replicator.ReplicationData -= this.EnqueueReplicationDataForAllPeers;
+		replicator.SpawnChild -= this.EnqueueSpawnForAllPeers;
+	}
+
+	private void EnqueueReplicationDataForAllPeers(ReplicationData data)
+	{
+		foreach (ConnectedPeer peer in this.ConnectedPeers.Values)
+			peer.EnqueueReplicationData(data);
+	}
+
+	private void EnqueueSpawnForAllPeers(SpawnData data)
+	{
+		foreach (ConnectedPeer peer in this.ConnectedPeers.Values)
+			peer.EnqueueSpawn(data);
 	}
 
 	public TimeSpan GetReplicationInterpolationTime(Node node)
