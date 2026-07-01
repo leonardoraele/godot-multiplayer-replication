@@ -1,4 +1,6 @@
 using System;
+using System.Linq;
+using System.Threading.Tasks;
 using Godot;
 using Raele.GodotUtils.Extensions;
 
@@ -17,7 +19,11 @@ public partial class MultiplayerInstantiator : Node
 	public static void SetNetworkSpawned(Node node, bool value = true)
 	{
 		if (value)
+		{
+			if (!NetworkIdManager.HasId(node))
+				NetworkIdManager.SetNewId(node);
 			node.Owner.AddToGroup(GROUP_SPAWNED);
+		}
 		else
 			node.Owner.RemoveFromGroup(GROUP_SPAWNED);
 	}
@@ -35,19 +41,7 @@ public partial class MultiplayerInstantiator : Node
 	/// Likewise, whenever a child node is removed from one of these spawn parents, it will be automatically despawned
 	/// on the other peers.
 	/// </summary>
-	[Export] public Node?[] SpawnParents
-	{
-		get;
-		set
-		{
-			this.StopObservingSpawnParents();
-			field = value;
-			if (this.Owner.IsNodeReady())
-				this.StartObservingSpawnParents();
-			else
-				this.Owner.Connect(Node.SignalName.Ready, Callable.From(this.StartObservingSpawnParents), (uint) ConnectFlags.OneShot);
-		}
-	} = [];
+	[Export] public Node?[] SpawnParents = [];
 
 	[ExportSubgroup("Additional Options")]
 	/// <summary>
@@ -104,10 +98,17 @@ public partial class MultiplayerInstantiator : Node
 		}
 	}
 
-	// public override void _EnterTree()
-	// {
-	// 	base._EnterTree();
-	// }
+	public override void _EnterTree()
+	{
+		base._EnterTree();
+
+		foreach (Node parent in this.SpawnParents.WhereNotNull())
+		{
+			Action onParentChildOrderChanged = () => this.OnSpawnParentChildOrderChanged(parent);
+			parent.TreeEntered += () => parent.ChildOrderChanged += onParentChildOrderChanged;
+			parent.TreeExiting += () => parent.ChildOrderChanged -= onParentChildOrderChanged;
+		}
+	}
 
 	// public override void _ExitTree()
 	// {
@@ -135,23 +136,22 @@ public partial class MultiplayerInstantiator : Node
 	// -----------------------------------------------------------------------------------------------------------------
 	// METHODS
 	// -----------------------------------------------------------------------------------------------------------------
-	private void StartObservingSpawnParents()
-	{
-		foreach (Node parent in this.SpawnParents.WhereNotNull())
-		{
-			parent.ChildEnteredTree += this.OnChildEnteredSpawnParent;
-			parent.ChildExitingTree += this.OnChildExitingSpawnParent;
-			parent.ChildOrderChanged += this.OnChildOrderChangedInSpawnParent;
-		}
-	}
 
-	private void StopObservingSpawnParents()
+	private void OnSpawnParentChildOrderChanged(Node parent)
 	{
-		foreach (Node parent in this.SpawnParents.WhereNotNull())
+		if (!this.IsMultiplayerAuthority())
+			return;
+		foreach (Node child in parent.GetChildren().WhereNotNull())
 		{
-			parent.ChildEnteredTree -= this.OnChildEnteredSpawnParent;
-			parent.ChildExitingTree -= this.OnChildExitingSpawnParent;
-			parent.ChildOrderChanged -= this.OnChildOrderChangedInSpawnParent;
+			if (IsNetworkSpawned(child) || !this.IsNetworkSpawnable(child))
+				continue;
+			SetNetworkSpawned(child);
+			ReplicationManager.Instance.EnqueueSpawn(new SpawnData()
+			{
+				InstantiatorId = NetworkIdManager.GetId(this),
+				SceneUid = ResourceUid.PathToUid(child.SceneFilePath),
+				SpawnParentIndex = (byte) this.SpawnParents.IndexOf(parent),
+			});
 		}
 	}
 
@@ -168,7 +168,7 @@ public partial class MultiplayerInstantiator : Node
 		child.AddToGroup(GROUP_SPAWNED);
 		this.EmitSignal(SignalName.SpawnChild, new SpawnData()
 		{
-			ReplicatorId = this.NetworkId,
+			InstantiatorId = this.NetworkId,
 			SceneUid = ResourceUid.PathToUid(child.SceneFilePath),
 			SpawnParentIndex = (byte) this.SpawnParents.IndexOf(child.GetParent()),
 		});
@@ -183,4 +183,11 @@ public partial class MultiplayerInstantiator : Node
 			return;
 		this.EmitSignal(SignalName.DespawnChild, new DespawnData() { NetworkId = networkId });
 	}
+
+	public bool IsNetworkSpawnable(Node node)
+		=> !string.IsNullOrEmpty(node.SceneFilePath)
+			&& (
+				this.SceneSpawnWhitelist.Count() == 0
+				|| this.SceneSpawnWhitelist.Contains(node.SceneFilePath)
+			);
 }

@@ -37,13 +37,17 @@ public static class NetworkIdManager
 
 	public static bool TryGetId(Node child, out Guid id)
 	{
-		id = child.HasMeta(META_NETWORK_ID)
-			? new Guid(child.GetMeta(META_NETWORK_ID).AsByteArray())
-			: Guid.Empty;
+		if (!HasId(child))
+			SetNewId(child);
+		id = GetId(child);
 		return id != Guid.Empty;
 	}
 	public static Guid GetId(Node child)
-		=> TryGetId(child, out Guid id) ? id : Guid.Empty;
+		=> HasId(child)
+			? new Guid(child.GetMeta(META_NETWORK_ID).AsByteArray())
+			: Guid.Empty;
+	public static bool HasId(Node child)
+		=> child.HasMeta(META_NETWORK_ID);
 	public static void SetNewId(Node child)
 		=> SetId(child, Guid.NewGuid());
 	public static void SetId(Node child, Guid id)
