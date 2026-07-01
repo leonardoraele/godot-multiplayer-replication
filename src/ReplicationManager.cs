@@ -14,6 +14,9 @@ public partial class ReplicationManager : Node
     // STATICS
     // -----------------------------------------------------------------------------------------------------------------
 
+	public const int DEFAULT_PORT = 4000;
+	public const string SERVER_BIND_ADDRESS = "*";
+
     public static ReplicationManager Instance
 	{
 		get
@@ -27,9 +30,6 @@ public partial class ReplicationManager : Node
 			return field;
 		}
 	}
-
-	public const int DEFAULT_PORT = 4000;
-	public const string SERVER_BIND_ADDRESS = "*";
 
 	// -----------------------------------------------------------------------------------------------------------------
 	// EXPORTS

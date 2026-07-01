@@ -42,14 +42,18 @@ public partial class MultiplayerReplicator : Node
 	// STATICS
 	// -----------------------------------------------------------------------------------------------------------------
 
-	public const string GROUP_REPLICATORS = $"{nameof(Raele)}.{nameof(MultiplayerReplication)}.{nameof(MultiplayerReplicator)}";
-	public const string GROUP_SPAWNED = $"{nameof(Raele)}.{nameof(MultiplayerReplication)}.{nameof(MultiplayerReplicator)}.Spawned";
+	public MultiplayerReplicator()
+		// We generate and assign a new ID to the replicator in the constructor. This is useful when the node is
+		// initially added by the developer in the godot editor. This id is read by the SerializedNetworkId property,
+		// which is an export field that is saved to the scene file. When the scene is loaded, this constructor
+		// generates a new id, but it's immediately overriden by the id saved in the scene. This strategy ensures a
+		// replicator always has the same id for every peer.
+		=> NetworkIdManager.SetNewId(this);
 
 	// -----------------------------------------------------------------------------------------------------------------
 	// EXPORTS
 	// -----------------------------------------------------------------------------------------------------------------
 
-	[ExportGroup("Property Replication")]
 	/// <summary>
 	/// The list of field to replicate. Each entry is a node path with property path. The node path is relative to the
 	/// scene root. (i.e. the owner of this node)
@@ -76,35 +80,6 @@ public partial class MultiplayerReplicator : Node
 	/// <see cref="MultiplayerReplicator"/> nodes, each with its own replication strategy.
 	/// </summary>
 	[Export] public ReplicationStrategyEnum ReplicationStrategy = ReplicationStrategyEnum.ReliablyOnChange;
-
-	[ExportGroup("Spawning & Despawning Replication")]
-	/// <summary>
-	/// Whenever a child node is added to one of the nodes in this list, it will be automatically replicated to the
-	/// other peers -- meaning they will also instantiate the same scene and add it to this parent node. This is useful
-	/// for synchronizing dynamically spawned objects, such as bullets, enemies, or other objects that are not part of
-	/// the initial scene tree.
-	///
-	/// Likewise, whenever a child node is removed from one of these spawn parents, it will be automatically despawned
-	/// on the other peers.
-	/// </summary>
-	[Export] public Node?[] SpawnParents
-	{
-		get;
-		set { field = value; this.UpdateConfigurationWarnings(); }
-	} = [];
-
-	[ExportSubgroup("Additional Options")]
-	/// <summary>
-	/// If this list is not empty, only these explicitly listed scenes will be replicated to the other peers.
-	/// </summary>
-	[Export] public string[] SceneSpawnWhitelist = [];
-
-	/// <summary>
-	/// If this is enabled, this node will not despawn the replicated nodes when they are removed from their spawn
-	/// parents. This is useful to reduce bandwidth usage in cases where the clients can determine when to destroy the
-	/// spawned nodes by themselves.
-	/// </summary>
-	[Export] public bool DisableAutomaticDespawn = false;
 
 	// -----------------------------------------------------------------------------------------------------------------
 	// FIELDS
@@ -135,7 +110,12 @@ public partial class MultiplayerReplicator : Node
 	/// <summary>
 	/// Unique identifier for this <see cref="MultiplayerReplicator"/> across the network.
 	/// </summary>
-	public Guid NetworkId { get; private set; } = Guid.NewGuid();
+	[Obsolete("Use NetworkIdManager.GetId() and NetworkIdManager.SetId() instead.")]
+	public Guid NetworkId
+	{
+		get => NetworkIdManager.GetId(this);
+		set => NetworkIdManager.SetId(this, value);
+	}
 
 	// -----------------------------------------------------------------------------------------------------------------
 	// PROPERTIES
@@ -161,6 +141,7 @@ public partial class MultiplayerReplicator : Node
 
 	[Signal] public delegate void ReplicationDataEventHandler(ReplicationData data);
 	[Signal] public delegate void SpawnChildEventHandler(SpawnData data);
+	[Signal] public delegate void DespawnChildEventHandler(DespawnData data);
 
 	// -----------------------------------------------------------------------------------------------------------------
 	// INTERNAL TYPES
@@ -229,11 +210,6 @@ public partial class MultiplayerReplicator : Node
 	{
 		base._ValidateProperty(property);
 		switch (property["name"].AsString()) {
-			case nameof(this.SceneSpawnWhitelist):
-				property["type"] = (long) Variant.Type.Array;
-				property["hint"] = (long) PropertyHint.ArrayType;
-				property["hint_string"] = $"{Variant.Type.String:D}/{PropertyHint.File:D}:*.tscn,*.scn";
-				break;
 			case nameof(this.SerializedNetworkId):
 				property["usage"] = (long) PropertyUsageFlags.Storage;
 				break;
@@ -252,13 +228,10 @@ public partial class MultiplayerReplicator : Node
 	public override void _EnterTree()
 	{
 		base._EnterTree();
-		this.AddToGroup(GROUP_REPLICATORS, persistent: true);
-		if (this.Owner.IsInGroup(GROUP_SPAWNED))
-		{
-			// TODO Handle when it is spawned by another peer.
-		}
 		if (Engine.IsEditorHint())
 			return;
+		if (MultiplayerInstantiator.IsNetworkSpawned(this))
+			NetworkIdManager.SetNewId(this);
 		ReplicationManager.Instance.RegisterReplicator(this);
 		ReplicationManager.Instance.NetworkProcess += this.ProcessNetwork;
 	}
@@ -290,10 +263,6 @@ public partial class MultiplayerReplicator : Node
 	// public override string[] _GetConfigurationWarnings()
 	// 	=> base._PhysicsProcess(delta);
 
-	// -----------------------------------------------------------------------------------------------------------------
-	// METHODS
-	// -----------------------------------------------------------------------------------------------------------------
-
 	/// <summary>
 	/// This method is called by the <see cref="ReplicationManager"/> every frame, but it only sends replication data to
 	/// the peers if the replication strategy is not set to <see cref="ReplicationStrategyEnum.ReliablyOnDemand"/>.
@@ -303,6 +272,10 @@ public partial class MultiplayerReplicator : Node
 		if (this.ReplicationStrategy != ReplicationStrategyEnum.ReliablyOnDemand)
 			this.ForceReplicate();
 	}
+
+	// -----------------------------------------------------------------------------------------------------------------
+	// PROPERTY REPLICATION METHODS
+	// -----------------------------------------------------------------------------------------------------------------
 
 	/// <summary>
 	/// Forces immediate replication of the current values of replicated fields to the other peers, regardless of
@@ -386,6 +359,10 @@ public partial class MultiplayerReplicator : Node
 		helper.InterpolationTween.TweenMethod(setter, helper.CurrentValue, newValue, duration);
 	}
 
+	// -----------------------------------------------------------------------------------------------------------------
+	// INTEREST METHODS
+	// -----------------------------------------------------------------------------------------------------------------
+
 	// private void OnPeerChangedInterest(ConnectedPeer peer)
 	// {
 	// 	if (
@@ -406,6 +383,10 @@ public partial class MultiplayerReplicator : Node
 	// 	// 	this.RpcId(peer.Id, MethodName.RpcSetValues, uint.MaxValue, this.GetLocalValues(uint.MaxValue));
 	// 	// }
 	// }
+
+	// -----------------------------------------------------------------------------------------------------------------
+	// OTHER METHODS
+	// -----------------------------------------------------------------------------------------------------------------
 
 	private void OnAddReplicationFieldButtonPressed()
 	{
